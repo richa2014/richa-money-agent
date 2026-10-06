@@ -1,0 +1,154 @@
+{
+  "version": "1.0",
+  "updated": "2026-10-04",
+  "description": "Machine-readable registry of community skill packs installable via bin/install-skill-pack. Mirrors the human-readable table in README.md.",
+  "packs": [
+    {
+      "repo": "clawhunter/clawhunter-skills",
+      "name": "clawhunter-skills",
+      "description": "Aggregates and AI-triages crypto bounties across venues (Pump Fun GO, Atelier, EarnFi, tiny.place) and matches each to your agent with a plan to win \u2014 plus paid research and create tools (voice tones, logo-grounded images, Kling video direction, web + X research). Paid tools settle via x402 (USDC on Solana or Base).",
+      "author": "clawhunter",
+      "license": "MIT",
+      "homepage": "https://clawhunter.fun",
+      "category": "crypto",
+      "trust_level": "community",
+      "skills": [
+        "clawhunter-bounties",
+        "clawhunter-content-studio"
+      ]
+    },
+    {
+      "repo": "CharonAI-code/charon",
+      "path": "skills/aeon",
+      "name": "Charon for AEON",
+      "description": "Repo-local policy enforcement for AEON runs, with guided setup and natural-language policy management.",
+      "author": "CharonAI-code",
+      "license": "MIT",
+      "homepage": "https://charon.codes",
+      "category": "dev",
+      "trust_level": "community",
+      "skills": [
+        "charon-setup",
+        "charon-policy"
+      ],
+      "secrets_required": [],
+      "capabilities": [
+        "external_api",
+        "writes_external_host"
+      ]
+    },
+    {
+      "repo": "richard7463/ai2human-aeon-skill-pack",
+      "name": "AI2Human Create Task",
+      "description": "Human execution for Aeon - dispatch blocked human steps to AI2Human and follow proof -> verify -> settle.",
+      "author": "richard7463",
+      "license": "MIT",
+      "homepage": "https://ai2human.io",
+      "category": "crypto",
+      "trust_level": "community",
+      "skills": [
+        "ai2human-handoff"
+      ],
+      "secrets_required": [
+        "AI2HUMAN_AGENT_KEY"
+      ],
+      "capabilities": [
+        "external_api",
+        "sends_notifications"
+      ]
+    },
+    {
+      "repo": "JessieJanie/aeon-skill-pack-skim",
+      "name": "Skim Clean Reads",
+      "description": "Pay-per-call clean web reads via Skim x402 \u2014 any URL to clean markdown ~4x smaller than raw HTML (fewer tokens per model step), $0.002 USDC on Base ($0.005 with JS rendering), no API key.",
+      "author": "JessieJanie",
+      "license": "MIT",
+      "homepage": "https://skim402.com",
+      "category": "research",
+      "trust_level": "community",
+      "skills": [
+        "skim-read"
+      ]
+    },
+    {
+      "repo": "thesmithdao/cultos-aeon-skills",
+      "name": "CultOS Aeon Skills",
+      "description": "Read-only exact-commit pull-request reviews for CultOS ACP jobs, with bounded verdicts and findings.",
+      "author": "thesmithdao",
+      "license": "MIT",
+      "homepage": "https://cultos.dev",
+      "category": "dev",
+      "trust_level": "community",
+      "skills": [
+        "cultos-acp-review"
+      ],
+      "secrets_required": [],
+      "capabilities": [
+        "read_only",
+        "external_api"
+      ]
+    },
+    {
+      "repo": "amritmirch/aeon-skill-pack-farcaster",
+      "name": "Farcaster Pack",
+      "description": "Publish to Farcaster from Aeon via Neynar. Drafting and publishing are separate branches; the default never posts. Publishing is fail-closed behind a kill-switch, daily cap, dedup ledger, 1024-byte protocol check, and a secret tripwire.",
+      "author": "amritmirch",
+      "license": "MIT",
+      "homepage": "https://github.com/amritmirch/aeon-skill-pack-farcaster",
+      "category": "social",
+      "trust_level": "community",
+      "skills": [
+        "cast"
+      ]
+    },
+    {
+      "repo": "jsfranklin221/aeon-skill-pack-spoolis",
+      "name": "Spoolis Outcome Gate",
+      "description": "Gate autonomous work on whether it satisfied the agreement: one-call verification against explicit acceptance criteria returns a signed Outcome Receipt with per-unit earned value, plus a chain verdict downstream steps can branch on. Keyless sandbox, zero secrets.",
+      "author": "spoolis",
+      "license": "MIT",
+      "homepage": "https://spoolis.com",
+      "category": "dev",
+      "trust_level": "community",
+      "skills": [
+        "spoolis-outcome-gate"
+      ]
+    },
+    {
+      "repo": "richard7463/aeon-skill-pack-claim-audit",
+      "name": "Claim Audit",
+      "description": "Truth-of-what-was-said for an unattended instance: extract the checkable claims from recent run logs, re-verify each at its own authoritative source, grade the evidence E0-E4, and contradict the ones that do not survive. Notifies only on a contradiction or a state change.",
+      "author": "richard7463",
+      "license": "MIT",
+      "homepage": "https://github.com/richard7463/aeon-skill-pack-claim-audit",
+      "category": "dev",
+      "trust_level": "community",
+      "skills": [
+        "claim-audit"
+      ],
+      "secrets_required": [],
+      "capabilities": [
+        "external_api",
+        "sends_notifications"
+      ]
+    },
+    {
+      "repo": "Svector-anu/aeon-messaging-pack",
+      "name": "Messaging Pack",
+      "description": "Weekly review of a product site's copy against a plain-language messaging playbook: rewrites for the worst problems, adoption tracking, and one new lesson learned from a reference site each run. Read-only; never edits the site.",
+      "author": "Svector-anu",
+      "license": "MIT",
+      "homepage": "https://github.com/Svector-anu/aeon-messaging-pack",
+      "category": "productivity",
+      "trust_level": "community",
+      "skills": [
+        "messaging-review"
+      ],
+      "secrets_required": [],
+      "capabilities": [
+        "read_only",
+        "sends_notifications"
+      ]
+    }
+  ]
+}

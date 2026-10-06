@@ -1,0 +1,544 @@
+name: Aeon · Scheduler
+run-name: "scheduler: cron"
+
+# The cron scheduler. Extracted from messages.yml so scheduling and message
+# polling are independent workflows: separate failure domains, timeouts, and
+# concurrency. This job parses the root aeon.yml, cron-matches enabled skills /
+# chains / reactive triggers with a debt/catch-up model (scripts/cron-due.sh),
+# dispatches aeon.yml + chain-runner.yml, and commits memory/cron-state.json.
+#
+# GitHub delivers only ~10% of */5 schedule ticks, so an external uptime pinger
+# may POST a `cron-tick` repository_dispatch to catch up missed slots (the debt
+# model below makes that safe — a slot can't double-fire). messages.yml also
+# listens to schedule + cron-tick to drive its poller; the two never overlap
+# because each workflow owns a disjoint step.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [cron-tick]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write   # append cron dispatch events to the Issues-as-state ledger
+                  # (§3); harmless when STATE_BACKEND is unset/file
+  actions: write  # to `gh workflow run aeon.yml` / `chain-runner.yml`
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NODE_OPTIONS: '--no-deprecation'
+
+# Ticks serialize so a slow tick can't overlap the next and double-dispatch.
+concurrency:
+  group: aeon-scheduler
+  cancel-in-progress: false
+
+jobs:
+  schedule:
+    runs-on: ubuntu-24.04
+    # 10 min: a big catch-up tick (many owed slots after a delivery gap) does one
+    # gh call + a 1s spacer per dispatch and persists state once at the end, so a
+    # 5-min cap could cancel it mid-way and lose every stamp (all re-fire).
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          token: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "aeonframework"
+          git config user.email "aeonframework@proton.me"
+
+      - name: Determine and dispatch scheduled skills
+        env:
+          GH_TOKEN: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+          STATE_BACKEND: ${{ vars.STATE_BACKEND }}
+          BREAKER_THRESHOLD_OVERRIDE: ${{ vars.BREAKER_THRESHOLD }}
+          BREAKER_COOLDOWN_OVERRIDE: ${{ vars.BREAKER_COOLDOWN_MIN }}
+        run: |
+          NOW_ISO=$(date -u +%FT%TZ)
+          NOW_EPOCH=$(date -u +%s)
+
+          # Catch-up depth, in hours, for both skills and chains. GitHub delivers
+          # only ~10% of the */5 ticks, so gaps routinely exceed a 2h window and a
+          # due slot would age out and silently drop. scripts/cron-due.sh treats
+          # each skill/chain's last dispatch as a debt ledger and catches up any
+          # slot missed within this many hours. It is also the de-facto max
+          # lateness: a slot older than this is skipped rather than fired stale.
+          # 12h covers a bad half-day tick outage while staying same-day (a daily
+          # skill's slots are 24h apart, so this can never double-fire). Tune here.
+          CATCHUP_HOURS=12
+
+          # Circuit breaker: once a skill has failed BREAKER_THRESHOLD times in a
+          # row (consecutive_failures, folded by scripts/state_reduce.py), stop
+          # dispatching it every tick so a real outage (a dead upstream API, a
+          # revoked key) doesn't burn a run every */5 for hours. The breaker is
+          # auto-recovering, not a kill switch: while open it still lets ONE probe
+          # run through every BREAKER_COOLDOWN_MIN minutes (half-open). A probe
+          # that succeeds resets consecutive_failures to 0 and the skill resumes
+          # its normal schedule on the next tick; a probe that fails re-arms the
+          # cooldown. A probe also waits for a slot the skill's own schedule owes,
+          # so the probe interval is max(cooldown, cron period): a weekly skill in
+          # an outage is probed weekly, not ~4x/day. This supersedes the 30-min
+          # failed-skill retry below for skills that have crossed the threshold.
+          # skill-health already reports CRITICAL at consecutive_failures >= 3, so
+          # a tripped breaker is visible.
+          # Set BREAKER_THRESHOLD=0 to disable. Tune via repo vars if desired.
+          BREAKER_THRESHOLD="${BREAKER_THRESHOLD_OVERRIDE:-3}"
+          BREAKER_COOLDOWN_MIN="${BREAKER_COOLDOWN_OVERRIDE:-360}"
+
+          # Quick retries: a failed skill is re-dispatched after 30 min, but only
+          # while its failure streak is under RETRY_LIMIT (the breaker threshold,
+          # or 3 with the breaker off). That is 2 quick retries for the slot that
+          # failed; after that the skill only runs on its own cron cadence (or the
+          # breaker's probes), never every 30 min forever.
+          RETRY_LIMIT="$BREAKER_THRESHOLD"
+          [ "$RETRY_LIMIT" -gt 0 ] || RETRY_LIMIT=3
+
+          # (Cron matching + the due/skip decision live in scripts/cron-due.sh,
+          # called by both the per-skill and per-chain loops below.)
+
+          # --- Load cron state ---
+          # Issues-as-state (hardening §3) tri-state, matching aeon.yml/chain-runner:
+          #   file (DEFAULT) — self-contained: commit cron-state.json only, no Issue
+          #                    reads/writes. Best for fork-and-forget; the debt model
+          #                    self-heals the rare commit race (a lost write re-fires).
+          #   dual           — opt-in: file authoritative, but ALSO mirror each dispatch
+          #                    to the pinned Issue so the ledger builds up for a later flip.
+          #   issues         — the Issue is source of truth: fold it into the file before
+          #                    reading, append dispatches, and skip the file commit.
+          STATE_FILE="memory/cron-state.json"
+          BACKEND="${STATE_BACKEND:-file}"
+          if [ "$BACKEND" = "issues" ]; then
+            if GH_REPO="$GITHUB_REPOSITORY" bash scripts/state_store.sh materialize "aeon:cron-state" "$STATE_FILE" >/dev/null 2>&1; then
+              echo "cron-state materialized from the Issues backend"
+            else
+              echo "::warning::could not materialize cron-state from the Issue; using committed file"
+            fi
+          fi
+          if [ -f "$STATE_FILE" ] && jq empty "$STATE_FILE" 2>/dev/null; then
+            STATE=$(cat "$STATE_FILE")
+          else
+            STATE='{}'
+          fi
+
+          # Mirror a dispatch to the append-only Issue ledger (dual/issues): fold a
+          # "dispatched" event -> last_dispatch (scripts/state_reduce.py) so the
+          # watermark survives without a file commit. Memoizes the issue number and
+          # no-ops in file mode. Used for both skills ("$SKILL") and chains
+          # ("chain:$CH"). An optional 2nd arg records the source skill that tripped
+          # a reactive handler. $NOW_ISO / $BACKEND are in scope from above.
+          STATE_ISSUE=""
+          STATE_ISSUE_TRIED=false
+          append_dispatch_event() {
+            local key="$1" src="${2:-}" ev
+            [ "$BACKEND" = "file" ] && return 0
+            if [ "$STATE_ISSUE_TRIED" = "false" ]; then
+              STATE_ISSUE_TRIED=true
+              STATE_ISSUE=$(GH_REPO="$GITHUB_REPOSITORY" bash scripts/state_store.sh ensure "aeon:cron-state" 2>/dev/null | tr -d '[:space:]' || true)
+            fi
+            [ -z "$STATE_ISSUE" ] && return 0
+            ev=$(jq -cn --arg s "$key" --arg ts "$NOW_ISO" --arg src "$src" \
+              '{skill:$s,status:"dispatched",ts:$ts} + (if $src != "" then {source:$src} else {} end)')
+            GH_REPO="$GITHUB_REPOSITORY" bash scripts/state_store.sh append "$STATE_ISSUE" "$ev" \
+              || echo "::warning::dispatch-event append failed for $key (backend=$BACKEND)"
+          }
+
+          # Record an accepted dispatch: stamp last_dispatch in STATE, remember the
+          # key so the persist retry below can re-apply it on top of upstream's
+          # cron-state, and mirror it to the Issue ledger. Keys are skills, chain-
+          # covered skills, and "chain:<name>". An optional source (reactive
+          # handlers) is kept in .<handler>.reactive_sources[<source>].
+          STAMPED=()
+          REACTIVE_STAMPED=()
+          stamp() {
+            local key="$1" src="${2:-}"
+            STAMPED+=("$key")
+            STATE=$(echo "$STATE" | jq --arg s "$key" --arg ts "$NOW_ISO" \
+              '.[$s].last_dispatch = $ts | .[$s].last_status = "dispatched"')
+            if [ -n "$src" ]; then
+              REACTIVE_STAMPED+=("$key $src")
+              STATE=$(echo "$STATE" | jq --arg s "$key" --arg src "$src" --arg ts "$NOW_ISO" \
+                '.[$s].reactive_sources[$src] = $ts')
+            fi
+            append_dispatch_event "$key" "$src"
+          }
+          # stdin cron-state JSON -> stdout with every stamp of this tick applied.
+          apply_stamps() {
+            local json key pair
+            json=$(cat)
+            for key in "${STAMPED[@]}"; do
+              json=$(echo "$json" | jq --arg s "$key" --arg ts "$NOW_ISO" \
+                '.[$s].last_dispatch = $ts | .[$s].last_status = "dispatched"')
+            done
+            for pair in "${REACTIVE_STAMPED[@]}"; do
+              json=$(echo "$json" | jq --arg s "${pair%% *}" --arg src "${pair#* }" --arg ts "$NOW_ISO" \
+                '.[$s].reactive_sources[$src] = $ts')
+            done
+            echo "$json"
+          }
+
+          # --- Parse aeon.yml ---
+          # scripts/parse-aeon-config.sh reads aeon.yml with a real YAML parser
+          # (yq) and emits one record per skill, chain, and reactive trigger, taken
+          # only from the top-level skills: / chains: / reactive: keys and never
+          # from comments (the old inline line-regex parsers registered chain and
+          # channel keys as skills and read commented chain examples). Fixture
+          # tests: scripts/tests/test_parse_aeon_config.sh. Invalid YAML fails the
+          # tick loudly instead of dispatching from a half-parsed config.
+          if ! CONFIG_RECORDS=$(bash scripts/parse-aeon-config.sh aeon.yml); then
+            echo "::error::could not parse aeon.yml (see above); nothing dispatched this tick"
+            exit 1
+          fi
+          declare -A SKILL_ENABLED SKILL_SCHEDULE SKILL_VAR CHAIN_SCHEDULE CHAIN_SKILLS REACTIVE_TRIGGERS
+          SKILL_ORDER=()
+          CHAIN_ORDER=()
+          while IFS=$'\x1f' read -r KIND F1 F2 F3 F4; do
+            case "$KIND" in
+              skill)
+                [ -n "${SKILL_ENABLED[$F1]+x}" ] || SKILL_ORDER+=("$F1")
+                SKILL_ENABLED["$F1"]="$F2"; SKILL_SCHEDULE["$F1"]="$F3"; SKILL_VAR["$F1"]="$F4" ;;
+              chain)
+                CHAIN_ORDER+=("$F1"); CHAIN_SCHEDULE["$F1"]="$F2"; CHAIN_SKILLS["$F1"]="$F3" ;;
+              reactive)
+                REACTIVE_TRIGGERS["$F1"]+="${F2}:${F3};" ;;
+            esac
+          done <<< "$CONFIG_RECORDS"
+
+          # --- Match skills ---
+          MATCHED=()
+          for SKILL in "${SKILL_ORDER[@]}"; do
+            [ "${SKILL_ENABLED[$SKILL]}" = "false" ] && continue
+            SCHED="${SKILL_SCHEDULE[$SKILL]}"
+            [ -z "$SCHED" ] && continue
+            [ "$SCHED" = "workflow_dispatch" ] && continue
+            [ "$SCHED" = "reactive" ] && continue
+
+            # Read state for this skill
+            LAST_STATUS=$(echo "$STATE" | jq -r --arg s "$SKILL" '.[$s].last_status // "none"')
+            LAST_DISPATCH=$(echo "$STATE" | jq -r --arg s "$SKILL" '.[$s].last_dispatch // "1970-01-01T00:00:00Z"')
+            LAST_DISPATCH_EPOCH=$(date -u -d "$LAST_DISPATCH" +%s 2>/dev/null || echo 0)
+            MINUTES_SINCE=$(( (NOW_EPOCH - LAST_DISPATCH_EPOCH) / 60 ))
+
+            # Is a scheduled slot owed (exact-slot "debt" model)? scripts/cron-due.sh
+            # compares the most recent slot (within CATCHUP_HOURS) against the last
+            # dispatch. Gates both the breaker probe and normal cron matching below.
+            SLOT_OWED=0
+            if SLOT_ISO=$(bash scripts/cron-due.sh "$SCHED" "$NOW_EPOCH" "$LAST_DISPATCH_EPOCH" "$CATCHUP_HOURS"); then
+              SLOT_OWED=1
+            fi
+
+            # --- Circuit breaker (auto-recovering) ---
+            # A skill that has failed BREAKER_THRESHOLD+ times in a row is likely
+            # hitting an outage, not a one-off. scripts/breaker.sh decides whether
+            # to skip it this tick (open) or let one probe through (half-open) so a
+            # real outage can't burn a run every */5 for hours. A successful probe
+            # resets consecutive_failures (state_reduce.py), closing the breaker so
+            # the normal schedule resumes next tick. This gate sits before both the
+            # 30-min retry and cron matching, so once tripped it governs the skill
+            # until it recovers. A probe needs both the cooldown AND an owed slot,
+            # so it never runs more often than the skill's own schedule.
+            # BREAKER_THRESHOLD=0 disables it (breaker.sh returns "closed"). The
+            # decision logic is the script's, not inlined here.
+            CONSEC=$(echo "$STATE" | jq -r --arg s "$SKILL" '.[$s].consecutive_failures // 0')
+            case "$(bash scripts/breaker.sh "$CONSEC" "$MINUTES_SINCE" "$BREAKER_THRESHOLD" "$BREAKER_COOLDOWN_MIN" "$SLOT_OWED")" in
+              probe)
+                echo "Circuit breaker HALF-OPEN: $SKILL ($CONSEC consecutive failures) - probing after ${MINUTES_SINCE}m (slot: $SLOT_ISO)"
+                MATCHED+=("$SKILL")
+                continue ;;
+              open)
+                if [ "$MINUTES_SINCE" -lt "$BREAKER_COOLDOWN_MIN" ]; then
+                  echo "Circuit breaker OPEN: $SKILL ($CONSEC consecutive failures) - skip, next probe in $(( BREAKER_COOLDOWN_MIN - MINUTES_SINCE ))m"
+                else
+                  echo "Circuit breaker OPEN: $SKILL ($CONSEC consecutive failures) - skip, next probe at its next scheduled slot"
+                fi
+                continue ;;
+            esac
+
+            # --- Retry failed skills (after 30 min cooldown, bounded) ---
+            if [ "$LAST_STATUS" = "failed" ] && [ "$MINUTES_SINCE" -ge 30 ] && [ "$CONSEC" -lt "$RETRY_LIMIT" ]; then
+              echo "Retrying failed skill: $SKILL (failed ${MINUTES_SINCE}m ago)"
+              MATCHED+=("$SKILL")
+              continue
+            fi
+
+            # --- Normal cron matching (exact-slot "debt" model) ---
+            # scripts/cron-due.sh decides due/skip by comparing the most recent
+            # scheduled slot (within CATCHUP_HOURS) against last dispatch. This
+            # replaces the old "first tick past the minute + 2h hour-window +
+            # flat 150m dedup" heuristic, which silently dropped any slot that
+            # aged out of the window before a (throttled) tick could see it.
+            # Anchoring on the exact slot means it can't double-fire, so no dedup
+            # window is needed; it also evaluates day-of-month/week against the
+            # slot's own date, fixing alternating-day catch-up across midnight.
+            if [ "$SLOT_OWED" = "1" ]; then
+              MATCHED+=("$SKILL")
+              echo "Matched: $SKILL (schedule: $SCHED, slot: $SLOT_ISO)"
+            fi
+          done
+
+          if [ ${#MATCHED[@]} -eq 0 ]; then
+            echo "No skills matched"
+          fi
+
+          # --- Parse depends_on from SKILL.md frontmatter ---
+          declare -A SKILL_DEPS
+          for SKILL in "${MATCHED[@]}"; do
+            SKILL_FILE="skills/${SKILL}/SKILL.md"
+            if [ -f "$SKILL_FILE" ]; then
+              # depends_on may be inline (`[a, b]`) or block (`- a` lines), top-level
+              # or nested under `metadata:` (Agent Skills spec form). Emit comma-joined.
+              DEPS=$(awk '
+                /^---$/{n++; next} n!=1{next}
+                collecting {
+                  if ($0 ~ /^[ \t]*-[ \t]*/) { it=$0; sub(/^[ \t]*-[ \t]*/,"",it); sub(/[ \t]*#.*/,"",it); gsub(/[ \t]/,"",it); if(it!="") acc=(acc==""?it:acc","it); next }
+                  collecting=0; print acc; exit
+                }
+                /^[^ \t]/{im=0} /^metadata:/{im=1}
+                /^depends_on:/ || (im && /^[ \t]+depends_on:/){
+                  if ($0 ~ /\[/) { line=$0; sub(/^[ \t]*depends_on:[ \t]*\[/,"",line); sub(/\].*/,"",line); gsub(/[ \t]/,"",line); print line; exit }
+                  collecting=1; next
+                }
+                END { if (collecting) print acc }
+              ' "$SKILL_FILE" || true)
+              [ -n "$DEPS" ] && SKILL_DEPS["$SKILL"]="$DEPS"
+            fi
+          done
+
+          # --- Order dispatches: dependencies first, then dependents ---
+          DEPS_FIRST=()
+          DEPS_LAST=()
+          for SKILL in "${MATCHED[@]}"; do
+            if [ -n "${SKILL_DEPS[$SKILL]:-}" ]; then
+              DEPS_LAST+=("$SKILL")
+            else
+              DEPS_FIRST+=("$SKILL")
+            fi
+          done
+          ORDERED=("${DEPS_FIRST[@]}" "${DEPS_LAST[@]}")
+
+          # --- Chains (parsed above with the skills) ---
+          CHAIN_COVERED_SKILLS=()
+          # Match chains against current time
+          MATCHED_CHAINS=()
+          for CH in "${CHAIN_ORDER[@]}"; do
+            SCHED="${CHAIN_SCHEDULE[$CH]:-}"
+            [ -z "$SCHED" ] && continue
+
+            CHAIN_KEY="chain:$CH"
+            LAST_DISPATCH=$(echo "$STATE" | jq -r --arg s "$CHAIN_KEY" '.[$s].last_dispatch // "1970-01-01T00:00:00Z"')
+            LAST_DISPATCH_EPOCH=$(date -u -d "$LAST_DISPATCH" +%s 2>/dev/null || echo 0)
+
+            # Same exact-slot debt decision as the per-skill path (scripts/cron-due.sh).
+            bash scripts/cron-due.sh "$SCHED" "$NOW_EPOCH" "$LAST_DISPATCH_EPOCH" "$CATCHUP_HOURS" >/dev/null || continue
+
+            MATCHED_CHAINS+=("$CH")
+            echo "Matched chain: $CH (schedule: $SCHED)"
+          done
+
+          # --- Dispatch chains ---
+          for CH in "${MATCHED_CHAINS[@]}"; do
+            echo "Dispatching chain: $CH"
+            # Same exit-code guard + Issue-ledger mirror as the per-skill dispatch:
+            # only record a dispatch GitHub accepted, so a rejected one retries next
+            # tick instead of being silently marked done.
+            # Only an accepted chain covers its skills; if it was rejected, they still
+            # run standalone this tick.
+            if gh workflow run chain-runner.yml -f chain="$CH"; then
+              stamp "chain:$CH"
+              IFS=',' read -ra CH_SKILLS <<< "${CHAIN_SKILLS[$CH]}"
+              for s in "${CH_SKILLS[@]}"; do
+                [ -n "$s" ] && CHAIN_COVERED_SKILLS+=("$s")
+              done
+            else
+              echo "::warning::chain dispatch failed for $CH — leaving state untouched so the next tick retries"
+            fi
+            sleep 1
+          done
+
+          # --- Filter standalone skills: skip if covered by a chain dispatching now ---
+          FILTERED_ORDERED=()
+          for SKILL in "${ORDERED[@]}"; do
+            SKIP=false
+            for covered in "${CHAIN_COVERED_SKILLS[@]}"; do
+              if [ "$SKILL" = "$covered" ]; then
+                echo "Skipping standalone $SKILL (covered by chain)"
+                # The chain run pays this slot: stamp it, or the skill stays owed
+                # and runs standalone on the next tick anyway.
+                stamp "$SKILL"
+                SKIP=true
+                break
+              fi
+            done
+            $SKIP || FILTERED_ORDERED+=("$SKILL")
+          done
+          ORDERED=("${FILTERED_ORDERED[@]}")
+
+          # --- Evaluate reactive triggers (parsed above with the skills) ---
+          # A wildcard (`on: "*"`) handler rotates across failing sources: a
+          # source it was already dispatched for within this window is passed
+          # over, so one stuck skill (e.g. inside skill-repair's own 24h repair
+          # cooldown) can't monopolize the handler while others never get a turn.
+          # Matches skill-repair's 24h cooldown; tune here.
+          REACTIVE_SOURCE_COOLDOWN_MIN=1440
+          declare -A REACTIVE_SOURCE
+          # Check reactive triggers against cron state
+          for RSKILL in "${!REACTIVE_TRIGGERS[@]}"; do
+            # A handler switched off in its own skills: entry stays off.
+            if [ "${SKILL_ENABLED[$RSKILL]:-}" = "false" ]; then
+              echo "Skipping reactive $RSKILL (enabled: false in its skills: entry)"
+              continue
+            fi
+            IFS=';' read -ra RULES <<< "${REACTIVE_TRIGGERS[$RSKILL]}"
+            for rule in "${RULES[@]}"; do
+              [ -z "$rule" ] && continue
+              ON="${rule%%:*}"
+              WHEN="${rule#*:}"
+
+              # Check condition against all skills (or specific source skill)
+              TRIGGERED=false
+              MATCHED_SOURCE=""
+              for CHECK_SKILL in "${SKILL_ORDER[@]}"; do
+                [ "${SKILL_ENABLED[$CHECK_SKILL]}" = "false" ] && continue
+                [ "$ON" != "*" ] && [ "$ON" != "$CHECK_SKILL" ] && continue
+                # A wildcard handler never triggers on its own state.
+                [ "$ON" = "*" ] && [ "$CHECK_SKILL" = "$RSKILL" ] && continue
+
+                # Condition evaluation lives in scripts/reactive_when.sh so it can be
+                # unit-tested (scripts/tests/test_reactive_when.sh) and so all three
+                # documented conditions (consecutive_failures, last_status,
+                # success_rate) are handled in one place. success_rate was advertised
+                # in the reactive docs but had no evaluator branch here before.
+                SKILL_STATE=$(echo "$STATE" | jq -c --arg s "$CHECK_SKILL" '.[$s] // {}')
+                WRC=0
+                printf '%s' "$SKILL_STATE" | bash scripts/reactive_when.sh "$WHEN" || WRC=$?
+                if [ "$WRC" -eq 0 ]; then
+                  if [ "$ON" = "*" ]; then
+                    SRC_LAST=$(echo "$STATE" | jq -r --arg h "$RSKILL" --arg s "$CHECK_SKILL" \
+                      '.[$h].reactive_sources[$s] // "1970-01-01T00:00:00Z"')
+                    SRC_AGE=$(( (NOW_EPOCH - $(date -u -d "$SRC_LAST" +%s 2>/dev/null || echo 0)) / 60 ))
+                    if [ "$SRC_AGE" -lt "$REACTIVE_SOURCE_COOLDOWN_MIN" ]; then
+                      echo "Reactive $RSKILL: $CHECK_SKILL matched but was handled ${SRC_AGE}m ago; trying the next source"
+                      continue
+                    fi
+                  fi
+                  echo "Reactive trigger: $RSKILL (${CHECK_SKILL} matched: ${WHEN})"
+                  TRIGGERED=true
+                  MATCHED_SOURCE="$CHECK_SKILL"   # the skill that tripped this trigger
+                  break
+                elif [ "$WRC" -eq 2 ]; then
+                  echo "::warning::reactive trigger for '$RSKILL' has an unparseable condition: ${WHEN}"
+                  break
+                fi
+              done
+
+              if [ "$TRIGGERED" = "true" ]; then
+                # Dedup check
+                LAST_DISPATCH=$(echo "$STATE" | jq -r --arg s "$RSKILL" '.[$s].last_dispatch // "1970-01-01T00:00:00Z"')
+                LAST_DISPATCH_EPOCH=$(date -u -d "$LAST_DISPATCH" +%s 2>/dev/null || echo 0)
+                MINUTES_SINCE=$(( (NOW_EPOCH - LAST_DISPATCH_EPOCH) / 60 ))
+                if [ "$MINUTES_SINCE" -ge 90 ]; then
+                  ORDERED+=("$RSKILL")
+                  REACTIVE_SOURCE["$RSKILL"]="$MATCHED_SOURCE"
+                  # Hand the handler the skill that tripped it, so a reactive handler
+                  # (e.g. skill-repair on `on: "*"`) knows WHICH skill to act on. Only
+                  # when the handler declares no var of its own -- an explicit var wins.
+                  if [ -z "${SKILL_VAR[$RSKILL]:-}" ] && [ -n "${MATCHED_SOURCE:-}" ]; then
+                    SKILL_VAR["$RSKILL"]="$MATCHED_SOURCE"
+                    echo "Reactive $RSKILL var <- source skill '$MATCHED_SOURCE'"
+                  fi
+                else
+                  echo "Skipping reactive $RSKILL (dispatched ${MINUTES_SINCE}m ago)"
+                fi
+                break
+              fi
+            done
+          done
+
+          # --- Dispatch ---
+          DISPATCHED_DEPS=false
+          for SKILL in "${ORDERED[@]}"; do
+            if [ -n "${SKILL_DEPS[$SKILL]:-}" ] && [ "$DISPATCHED_DEPS" = "false" ]; then
+              DISPATCHED_DEPS=true
+              echo "Waiting 5s before dispatching skills with dependencies..."
+              sleep 5
+            fi
+
+            VAR="${SKILL_VAR[$SKILL]:-}"
+            DISPATCH_OK=true
+            if [ -n "$VAR" ]; then
+              echo "Dispatching: $SKILL (var: $VAR)${SKILL_DEPS[$SKILL]:+ [depends_on: ${SKILL_DEPS[$SKILL]}]}"
+              gh workflow run aeon.yml -f skill="$SKILL" -f var="$VAR" || DISPATCH_OK=false
+            else
+              echo "Dispatching: $SKILL${SKILL_DEPS[$SKILL]:+ [depends_on: ${SKILL_DEPS[$SKILL]}]}"
+              gh workflow run aeon.yml -f skill="$SKILL" || DISPATCH_OK=false
+            fi
+
+            # Stamp state ONLY for a dispatch GitHub actually accepted. A rejected
+            # one (e.g. secondary rate limit during a burst) leaves state untouched,
+            # so the next tick still sees the slot owed and retries — instead of the
+            # old behaviour that stamped "dispatched" regardless and let the dedup
+            # window bury a silent drop.
+            if [ "$DISPATCH_OK" = "true" ]; then
+              stamp "$SKILL" "${REACTIVE_SOURCE[$SKILL]:-}"
+            else
+              echo "::warning::dispatch failed for $SKILL — leaving cron state untouched so the next tick retries"
+            fi
+
+            # Spacer against the workflow_dispatch secondary rate limit; kept short
+            # so a large catch-up tick fits in the job timeout.
+            sleep 1
+          done
+
+          # --- Persist state ---
+          mkdir -p memory
+          if [ "$BACKEND" = "issues" ]; then
+            # Issues mode: the pinned Issue is source of truth and the dispatches were
+            # appended above. The file is a dropped projection — discard any working-
+            # tree change so the churn-free end state isn't committed.
+            git checkout -- "$STATE_FILE" 2>/dev/null || rm -f "$STATE_FILE"
+            echo "issues mode: dispatches appended to the Issue; not committing cron-state.json"
+            exit 0
+          fi
+
+          echo "$STATE" | jq '.' > "$STATE_FILE"
+
+          git add "$STATE_FILE"
+          if git diff --staged --quiet; then
+            echo "No state changes"
+          else
+            git commit -m "chore(scheduler): update cron state"
+            for i in 1 2 3 4 5; do
+              if git pull --rebase origin main 2>/dev/null && git push -u origin HEAD 2>/dev/null; then
+                echo "State committed on attempt $i"
+                break
+              fi
+              # Lost the race. Start over from upstream's cron-state and re-apply
+              # this tick's stamps (skills, chain-covered skills, chain:<name>,
+              # reactive sources). The old reset --soft + checkout -- file restored
+              # OUR copy from the index, so every retry replayed the same conflict
+              # and the stamps were lost (double dispatch next tick).
+              git rebase --abort 2>/dev/null || true
+              if ! git fetch origin main 2>/dev/null; then
+                sleep "$i"
+                continue
+              fi
+              git reset --hard FETCH_HEAD
+
+              if [ -f "$STATE_FILE" ] && jq empty "$STATE_FILE" 2>/dev/null; then
+                MERGED=$(cat "$STATE_FILE")
+              else
+                MERGED='{}'
+              fi
+              echo "$MERGED" | apply_stamps | jq '.' > "$STATE_FILE"
+              git add "$STATE_FILE"
+              git diff --staged --quiet && { echo "State already up to date after merge"; break; }
+              git commit -m "chore(scheduler): update cron state"
+              sleep "$i"
+            done
+          fi
