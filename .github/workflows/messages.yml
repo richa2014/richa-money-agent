@@ -1,0 +1,891 @@
+name: Aeon · Messages
+run-name: "${{ inputs.message && format('msg ({0}): {1}', inputs.source || 'user', inputs.message) || (github.event_name == 'repository_dispatch' && github.event.action != 'cron-tick' && format('msg ({0}): {1}', github.event.action, github.event.client_payload.message)) || 'poll' }}"
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'Message to process'
+        required: false
+        type: string
+      source:
+        description: 'Message source (telegram, discord, slack)'
+        required: false
+        type: string
+  repository_dispatch:
+    # Message types -> the heavy `run` job (Claude interprets). Routing types
+    # (from the instant-mode webhook, pre-classified) -> the lightweight `route`
+    # job (no LLM). cron-tick -> the `poll` job (an external uptime pinger uses it
+    # to catch up dropped */5 schedule ticks). Scheduling itself now lives in the
+    # separate scheduler.yml, which also listens to schedule + cron-tick.
+    types: [telegram-message, discord-message, slack-message, cron-tick, telegram-command, telegram-callback, telegram-reply]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write   # the route/run jobs may append to the Issues-as-state ledger
+                  # (§3); harmless when STATE_BACKEND is unset/file
+  actions: write  # the poll job calls `gh workflow run messages.yml` to dispatch
+                  # each collected message as its own `run`
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NODE_OPTIONS: '--no-deprecation'
+
+# Poll runs serialize (prevent duplicate polls). Message runs get unique groups (parallel execution).
+concurrency:
+  group: ${{ (github.event_name == 'repository_dispatch' || (github.event_name == 'workflow_dispatch' && inputs.message != '')) && format('aeon-msg-{0}', github.run_id) || 'aeon-poll' }}
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.message == '') || (github.event_name == 'repository_dispatch' && github.event.action == 'cron-tick')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          token: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "aeonframework"
+          git config user.email "aeonframework@proton.me"
+
+      - name: Collect and dispatch messages
+        env:
+          GH_TOKEN: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Owner user gate. TELEGRAM_CHAT_ID gates the *chat*; in a group/public
+          # chat that lets any member command the bot (chat.id matches, but they
+          # aren't the owner). This gates the *user*: it defaults to TELEGRAM_CHAT_ID,
+          # which is exactly the owner's id in a 1:1 DM (chat.id == user.id there),
+          # so DM setups need no new config. In a group a negative chat id never
+          # equals a positive user id, so buttons fail closed until the operator
+          # sets TELEGRAM_ALLOWED_USER_ID to their own numeric Telegram user id.
+          TELEGRAM_ALLOWED_USER_ID: ${{ vars.TELEGRAM_ALLOWED_USER_ID || secrets.TELEGRAM_ALLOWED_USER_ID }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          DISCORD_ALLOWED_AUTHOR_ID: ${{ vars.DISCORD_ALLOWED_AUTHOR_ID || secrets.DISCORD_ALLOWED_AUTHOR_ID }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_ALLOWED_USER_ID: ${{ vars.SLACK_ALLOWED_USER_ID || secrets.SLACK_ALLOWED_USER_ID }}
+        run: |
+          MESSAGES='[]'
+
+          # --- Telegram (collect ALL pending updates) ---
+          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+            # Owner user id: whoever is allowed to command the bot. Defaults to the
+            # chat id (correct for a 1:1 DM, where chat.id == user.id); in a group set
+            # TELEGRAM_ALLOWED_USER_ID so a button tap by a non-owner member is ignored.
+            TG_OWNER_UID="${TELEGRAM_ALLOWED_USER_ID:-$TELEGRAM_CHAT_ID}"
+            # A webhook and getUpdates are mutually exclusive: once a webhook is
+            # set (instant mode, see webhook/), getUpdates returns 409. Detect it
+            # and skip polling — the Worker delivers via repository_dispatch.
+            WEBHOOK_URL=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" | jq -r '.result.url // empty')
+            if [ -n "$WEBHOOK_URL" ]; then
+              echo "Telegram webhook active — skipping poll (instant mode delivers via repository_dispatch)"
+            else
+              # Fetch messages AND callback_query taps. allowed_updates now includes
+              # callback_query; the offset ack below advances past BOTH kinds, so
+              # button presses can't reprocess in a loop every tick.
+              RESPONSE=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=0&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D")
+              COUNT=$(echo "$RESPONSE" | jq '.result | length')
+              MAX_UPDATE_ID=""
+              TG_MESSAGES='[]'    # plain text -> Claude (existing behaviour)
+              TG_COMMANDS='[]'    # /slash commands and /start deep links
+              TG_REPLIES='[]'     # answers to force_reply prompts
+              TG_CALLBACKS='[]'   # inline-button taps
+
+              for ((i=0; i<COUNT; i++)); do
+                MAX_UPDATE_ID=$(echo "$RESPONSE" | jq -r ".result[$i].update_id // empty")
+
+                # Callback query (inline button tap)
+                CB_DATA=$(echo "$RESPONSE" | jq -r ".result[$i].callback_query.data // empty")
+                if [ -n "$CB_DATA" ]; then
+                  CB_CHAT=$(echo "$RESPONSE" | jq -r ".result[$i].callback_query.message.chat.id // empty")
+                  CB_FROM=$(echo "$RESPONSE" | jq -r ".result[$i].callback_query.from.id // empty")
+                  CB_ID=$(echo "$RESPONSE" | jq -r ".result[$i].callback_query.id // empty")
+                  # Stop the client's spinner immediately (safe pre-ack — no action taken yet).
+                  [ -n "$CB_ID" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery" -d "callback_query_id=$CB_ID" >/dev/null 2>&1 || true
+                  # Gate on chat AND user: the chat must be the owner's, and the tapping
+                  # user must be the owner — otherwise any member of a group chat could
+                  # dispatch skills / schedule crons just by tapping a posted button.
+                  if [ "$CB_CHAT" = "$TELEGRAM_CHAT_ID" ] && [ "$CB_FROM" = "$TG_OWNER_UID" ]; then
+                    TG_CALLBACKS=$(echo "$TG_CALLBACKS" | jq --arg d "$CB_DATA" '. + [$d]')
+                    echo "Telegram callback: $CB_DATA"
+                  elif [ "$CB_CHAT" = "$TELEGRAM_CHAT_ID" ]; then
+                    echo "::warning::Telegram callback from non-owner user '$CB_FROM' ignored (set TELEGRAM_ALLOWED_USER_ID to your id to command from a group)"
+                  fi
+                  continue
+                fi
+
+                # Message
+                TEXT=$(echo "$RESPONSE" | jq -r ".result[$i].message.text // empty")
+                CHAT=$(echo "$RESPONSE" | jq -r ".result[$i].message.chat.id // empty")
+                FROM=$(echo "$RESPONSE" | jq -r ".result[$i].message.from.id // empty")
+                [ -z "$TEXT" ] && continue
+                # Same owner gate as callbacks: right chat AND the owner user. In a 1:1
+                # DM both equal TELEGRAM_CHAT_ID; in a group a non-owner member is dropped.
+                [ "$CHAT" != "$TELEGRAM_CHAT_ID" ] && continue
+                [ "$FROM" != "$TG_OWNER_UID" ] && continue
+
+                REPLY_TO=$(echo "$RESPONSE" | jq -r ".result[$i].message.reply_to_message.text // empty")
+                if [[ "$REPLY_TO" =~ \[[a-zA-Z0-9_-]+::[a-zA-Z0-9_-]+\] ]]; then
+                  TG_REPLIES=$(echo "$TG_REPLIES" | jq --arg r "$REPLY_TO" --arg t "$TEXT" '. + [{reply_to:$r, text:$t}]')
+                  echo "Telegram reply -> $REPLY_TO"
+                elif [[ "$TEXT" == /* ]]; then
+                  TG_COMMANDS=$(echo "$TG_COMMANDS" | jq --arg t "$TEXT" '. + [$t]')
+                  echo "Telegram command: $TEXT"
+                else
+                  TG_MESSAGES=$(echo "$TG_MESSAGES" | jq --arg src "telegram" --arg txt "$TEXT" '. + [{source: $src, text: $txt}]')
+                  echo "Telegram: $TEXT"
+                fi
+              done
+
+              # Acknowledge updates BEFORE acting on them, and only proceed once
+              # Telegram confirms the offset advanced (ok:true) — a re-poll then
+              # can't re-read them. If the ack fails, leave everything pending for
+              # the next tick rather than risk double-processing.
+              if [ -n "$MAX_UPDATE_ID" ]; then
+                ACK_OK=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=$((MAX_UPDATE_ID + 1))" | jq -r '.ok // false')
+                if [ "$ACK_OK" = "true" ]; then
+                  # Plain text -> Claude via the shared MESSAGES dispatch path.
+                  MESSAGES=$(echo "$MESSAGES" | jq --argjson tg "$TG_MESSAGES" '. + $tg')
+                  # Commands / replies / callbacks -> the shared router, no LLM.
+                  # Any memory/*.log writes are committed at the end of this step.
+                  N=$(echo "$TG_COMMANDS" | jq 'length')
+                  for ((j=0; j<N; j++)); do
+                    CMD_TEXT=$(echo "$TG_COMMANDS" | jq -r ".[$j]")
+                    bash scripts/telegram-route.sh command "$CMD_TEXT" || echo "::warning::route command failed: $CMD_TEXT"
+                  done
+                  N=$(echo "$TG_REPLIES" | jq 'length')
+                  for ((j=0; j<N; j++)); do
+                    R_TO=$(echo "$TG_REPLIES" | jq -r ".[$j].reply_to")
+                    R_TX=$(echo "$TG_REPLIES" | jq -r ".[$j].text")
+                    bash scripts/telegram-route.sh reply "$R_TO" "$R_TX" || echo "::warning::route reply failed"
+                  done
+                  N=$(echo "$TG_CALLBACKS" | jq 'length')
+                  for ((j=0; j<N; j++)); do
+                    CB=$(echo "$TG_CALLBACKS" | jq -r ".[$j]")
+                    bash scripts/telegram-route.sh callback "$CB" || echo "::warning::route callback failed: $CB"
+                  done
+                else
+                  PENDING=$(( $(echo "$TG_MESSAGES" | jq 'length') + $(echo "$TG_COMMANDS" | jq 'length') + $(echo "$TG_REPLIES" | jq 'length') + $(echo "$TG_CALLBACKS" | jq 'length') ))
+                  [ "$PENDING" -gt 0 ] && echo "::warning::Telegram offset ack failed — leaving $PENDING update(s) pending to avoid double-processing"
+                fi
+              fi
+            fi
+          fi
+
+          # --- Discord (collect ALL unprocessed messages) ---
+          if [ -n "${DISCORD_BOT_TOKEN:-}" ] && [ -n "${DISCORD_CHANNEL_ID:-}" ]; then
+            # Opt-in author allowlist (GHSA-252c F5): without DISCORD_ALLOWED_AUTHOR_ID
+            # the only gate below is is_bot, so any non-bot member of the polled channel
+            # can issue trusted agent commands. Non-breaking nudge, not fail-closed —
+            # forks that never set it keep working, but the risk is loud and actionable.
+            if [ -z "${DISCORD_ALLOWED_AUTHOR_ID:-}" ]; then
+              echo "::warning::Discord polling is active with no DISCORD_ALLOWED_AUTHOR_ID set — any non-bot member of the channel can trigger agent runs. Set DISCORD_ALLOWED_AUTHOR_ID (your Discord user ID) to restrict it."
+            fi
+            RESPONSE=$(curl -s -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+              "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_ID/messages?limit=10")
+            COUNT=$(echo "$RESPONSE" | jq 'if type == "array" then length else 0 end')
+
+            for ((i=0; i<COUNT; i++)); do
+              CONTENT=$(echo "$RESPONSE" | jq -r ".[$i].content // empty")
+              IS_BOT=$(echo "$RESPONSE" | jq -r ".[$i].author.bot // false")
+              AUTHOR_ID=$(echo "$RESPONSE" | jq -r ".[$i].author.id // empty")
+              MSG_ID=$(echo "$RESPONSE" | jq -r ".[$i].id // empty")
+              HAS_CHECK=$(echo "$RESPONSE" | jq -r "[.[$i].reactions[]? | select(.emoji.name == \"✅\") | .me] | any")
+
+              if [ -n "${DISCORD_ALLOWED_AUTHOR_ID:-}" ] && [ "$AUTHOR_ID" != "$DISCORD_ALLOWED_AUTHOR_ID" ]; then
+                continue
+              fi
+
+              if [ -n "$CONTENT" ] && [ "$IS_BOT" != "true" ] && [ "$HAS_CHECK" != "true" ]; then
+                curl -s -X PUT -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+                  "https://discord.com/api/v10/channels/$DISCORD_CHANNEL_ID/messages/$MSG_ID/reactions/%E2%9C%85/@me" > /dev/null
+                MESSAGES=$(echo "$MESSAGES" | jq --arg src "discord" --arg txt "$CONTENT" '. + [{source: $src, text: $txt}]')
+                echo "Discord: $CONTENT"
+              fi
+            done
+          fi
+
+          # --- Slack (collect ALL unprocessed messages) ---
+          if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${SLACK_CHANNEL_ID:-}" ]; then
+            # Opt-in user allowlist (GHSA-252c F5): without SLACK_ALLOWED_USER_ID the
+            # only gate below is bot_id, so any non-bot member of the polled channel
+            # can issue trusted agent commands. Non-breaking nudge, not fail-closed —
+            # forks that never set it keep working, but the risk is loud and actionable.
+            if [ -z "${SLACK_ALLOWED_USER_ID:-}" ]; then
+              echo "::warning::Slack polling is active with no SLACK_ALLOWED_USER_ID set — any non-bot member of the channel can trigger agent runs. Set SLACK_ALLOWED_USER_ID (your Slack user ID) to restrict it."
+            fi
+            RESPONSE=$(curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+              "https://slack.com/api/conversations.history?channel=$SLACK_CHANNEL_ID&limit=10")
+            COUNT=$(echo "$RESPONSE" | jq '.messages | length')
+
+            for ((i=0; i<COUNT; i++)); do
+              TEXT=$(echo "$RESPONSE" | jq -r ".messages[$i].text // empty")
+              TS=$(echo "$RESPONSE" | jq -r ".messages[$i].ts // empty")
+              BOT_ID=$(echo "$RESPONSE" | jq -r ".messages[$i].bot_id // empty")
+              USER_ID=$(echo "$RESPONSE" | jq -r ".messages[$i].user // empty")
+              HAS_CHECK=$(echo "$RESPONSE" | jq -r ".messages[$i].reactions[]? | select(.name == \"white_check_mark\") | .name // empty")
+
+              if [ -n "${SLACK_ALLOWED_USER_ID:-}" ] && [ "$USER_ID" != "$SLACK_ALLOWED_USER_ID" ]; then
+                continue
+              fi
+
+              if [ -n "$TEXT" ] && [ -z "$BOT_ID" ] && [ -z "$HAS_CHECK" ]; then
+                curl -s -X POST -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  -d "$(jq -n --arg ch "$SLACK_CHANNEL_ID" --arg ts "$TS" \
+                    '{channel: $ch, timestamp: $ts, name: "white_check_mark"}')" \
+                  "https://slack.com/api/reactions.add" > /dev/null
+                MESSAGES=$(echo "$MESSAGES" | jq --arg src "slack" --arg txt "$TEXT" '. + [{source: $src, text: $txt}]')
+                echo "Slack: $TEXT"
+              fi
+            done
+          fi
+
+          # Dispatch each message as a separate workflow run
+          MSG_COUNT=$(echo "$MESSAGES" | jq 'length')
+          echo "Found $MSG_COUNT message(s)"
+
+          for ((i=0; i<MSG_COUNT; i++)); do
+            SOURCE=$(echo "$MESSAGES" | jq -r ".[$i].source")
+            TEXT=$(echo "$MESSAGES" | jq -r ".[$i].text")
+            echo "Dispatching [$SOURCE]: $TEXT"
+            gh workflow run messages.yml -R "$GITHUB_REPOSITORY" -f source="$SOURCE" -f message="$TEXT"
+          done
+
+          if [ "$MSG_COUNT" -eq 0 ]; then
+            echo "No new messages"
+          fi
+
+          # Persist any snooze/mute/save writes + a "Schedule weekly" aeon.yml edit
+          # made by inline callback routing.
+          git add memory/snoozes.log memory/mutes.log memory/saved.md aeon.yml 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(telegram): record snooze/mute/save/schedule from button taps"
+            for k in 1 2 3; do
+              if git pull --rebase origin main 2>/dev/null && git push origin HEAD 2>/dev/null; then break; fi
+              git rebase --abort 2>/dev/null || true
+              sleep "$k"
+            done
+          fi
+
+  route:
+    # Instant-mode path: the Cloudflare Worker pre-classifies an update and relays
+    # it here via repository_dispatch. This job routes it with NO LLM (fast, cheap),
+    # mirroring what the poller does inline. See scripts/telegram-route.sh.
+    if: >-
+      github.event_name == 'repository_dispatch' && contains(fromJSON('["telegram-command","telegram-callback","telegram-reply"]'), github.event.action)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          token: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "aeonframework"
+          git config user.email "aeonframework@proton.me"
+
+      - name: Route update
+        env:
+          GH_TOKEN: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ALLOWED_USER_ID: ${{ vars.TELEGRAM_ALLOWED_USER_ID || secrets.TELEGRAM_ALLOWED_USER_ID }}
+          _ACTION: ${{ github.event.action }}
+          # Payload fields via env (not template interpolation) so untrusted text
+          # can never break out into the shell. Each is JSON-encoded by toJSON.
+          _P_TEXT: ${{ toJSON(github.event.client_payload.text) }}
+          _P_DATA: ${{ toJSON(github.event.client_payload.data) }}
+          _P_REPLY_TO: ${{ toJSON(github.event.client_payload.reply_to_text) }}
+          _P_CHAT_ID: ${{ toJSON(github.event.client_payload.chat_id) }}
+          _P_FROM_ID: ${{ toJSON(github.event.client_payload.from_id) }}
+        run: |
+          CHAT_ID=$(printf '%s' "$_P_CHAT_ID" | jq -r 'tostring' 2>/dev/null || echo "null")
+          FROM_ID=$(printf '%s' "$_P_FROM_ID" | jq -r 'tostring' 2>/dev/null || echo "null")
+          OWNER_UID="${TELEGRAM_ALLOWED_USER_ID:-$TELEGRAM_CHAT_ID}"
+          # Defence in depth — the Worker already gates on chat + user; re-check both.
+          if [ -n "${TELEGRAM_CHAT_ID:-}" ] && [ "$CHAT_ID" != "null" ] && [ "$CHAT_ID" != "$TELEGRAM_CHAT_ID" ]; then
+            echo "::warning::route: chat_id '$CHAT_ID' is not the owner chat — ignoring"
+            exit 0
+          fi
+          if [ -n "$OWNER_UID" ] && [ "$FROM_ID" != "null" ] && [ "$FROM_ID" != "$OWNER_UID" ]; then
+            echo "::warning::route: from_id '$FROM_ID' is not the owner user — ignoring (set TELEGRAM_ALLOWED_USER_ID to command from a group)"
+            exit 0
+          fi
+          TEXT=$(printf '%s' "$_P_TEXT" | jq -r 'if . == null then "" else . end')
+          DATA=$(printf '%s' "$_P_DATA" | jq -r 'if . == null then "" else . end')
+          REPLY_TO=$(printf '%s' "$_P_REPLY_TO" | jq -r 'if . == null then "" else . end')
+          case "$_ACTION" in
+            telegram-command)  bash scripts/telegram-route.sh command  "$TEXT" ;;
+            telegram-callback) bash scripts/telegram-route.sh callback "$DATA" ;;
+            telegram-reply)    bash scripts/telegram-route.sh reply    "$REPLY_TO" "$TEXT" ;;
+          esac
+
+      - name: Commit memory changes
+        run: |
+          git add memory/snoozes.log memory/mutes.log memory/saved.md aeon.yml 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(telegram): record snooze/mute/save/schedule from button tap"
+            for k in 1 2 3; do
+              if git pull --rebase origin main 2>/dev/null && git push origin HEAD 2>/dev/null; then break; fi
+              git rebase --abort 2>/dev/null || true
+              sleep "$k"
+            done
+          fi
+
+  run:
+    # Only plain messages reach Claude. Pre-classified routing dispatches
+    # (telegram-command/-callback/-reply) go to the `route` job instead.
+    if: >-
+      (github.event_name == 'repository_dispatch' && contains(fromJSON('["telegram-message","discord-message","slack-message"]'), github.event.action))
+      || (github.event_name == 'workflow_dispatch' && inputs.message != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Extract message
+        id: msg
+        env:
+          _INPUT_MESSAGE: ${{ inputs.message }}
+          _INPUT_SOURCE: ${{ inputs.source }}
+          _PAYLOAD_MESSAGE: ${{ toJson(github.event.client_payload.message) }}
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            MESSAGE=$(printf '%s' "$_PAYLOAD_MESSAGE" | jq -r '.')
+            TYPE="${{ github.event.action }}"
+            SOURCE="webhook"
+            case "$TYPE" in
+              telegram-message) SOURCE="telegram" ;;
+              discord-message) SOURCE="discord" ;;
+              slack-message) SOURCE="slack" ;;
+            esac
+          else
+            MESSAGE="$_INPUT_MESSAGE"
+            SOURCE="$_INPUT_SOURCE"
+          fi
+
+          if [ -n "$MESSAGE" ] && [ "$MESSAGE" != "null" ]; then
+            echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+            echo "message<<ENDOFMESSAGE" >> "$GITHUB_OUTPUT"
+            echo "$MESSAGE" >> "$GITHUB_OUTPUT"
+            echo "ENDOFMESSAGE" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repo
+        if: steps.msg.outputs.source != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          token: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        if: steps.msg.outputs.source != ''
+        run: |
+          git config user.name "aeonframework"
+          git config user.email "aeonframework@proton.me"
+
+      - name: Setup Node.js
+        if: steps.msg.outputs.source != ''
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+
+      - name: Cache Claude Code (npm)
+        if: steps.msg.outputs.source != ''
+        # Shares the pinned-version cache with aeon.yml so the global install runs
+        # offline. Keep the version in the key in sync with the pin below.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.npm
+          key: claude-code-${{ runner.os }}-2.1.168
+          restore-keys: |
+            claude-code-${{ runner.os }}-
+
+      - name: Install Claude Code
+        if: steps.msg.outputs.source != ''
+        # Pinned for supply-chain safety — keep in sync with aeon.yml's pin
+        # (and the cache key version above).
+        run: npm install -g @anthropic-ai/claude-code@2.1.168 --prefer-offline
+
+      # Inbound messaging isn't a per-skill run, so no skill name is passed and
+      # the repo-global `harness:`/`model:` keys decide — the same script aeon.yml
+      # uses, so a repo answers messages on the harness it runs skills on.
+      - name: Resolve harness
+        id: harness
+        if: steps.msg.outputs.source != ''
+        env:
+          HARNESS_MODEL: ${{ vars.HARNESS_MODEL }}
+          # Native-auth secrets — presence ONLY, to detect which provider each
+          # harness runs on (native login/key > OpenRouter). Never echoed.
+          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
+          KIMI_AUTH: ${{ secrets.KIMI_AUTH }}
+          HERMES_AUTH: ${{ secrets.HERMES_AUTH }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+          VERCEL_OIDC_TOKEN: ${{ secrets.VERCEL_OIDC_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_OAUTH_TOKEN: ${{ secrets.ANTHROPIC_OAUTH_TOKEN }}
+          GROK_CREDENTIALS: ${{ secrets.GROK_CREDENTIALS }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+        run: bash scripts/resolve-harness.sh >> "$GITHUB_OUTPUT"
+
+      # Stage the resolved harness's CLI + provider auth. This step is why
+      # messages.yml now supports all seven: it previously had none, so a repo on
+      # codex/pi/vibe/kimi/fx had its messages answered on claude with a warning.
+      # The `env:` block is duplicated from aeon.yml by necessity (`secrets.*`
+      # resolves per workflow); the recipes it feeds are shared.
+      - name: Install harness CLI
+        if: steps.msg.outputs.source != '' && steps.harness.outputs.HARNESS != '' && steps.harness.outputs.HARNESS != 'claude'
+        env:
+          H: ${{ steps.harness.outputs.HARNESS }}
+          HM: ${{ steps.harness.outputs.HARNESS_MODEL }}
+          AUTH_MODE: ${{ steps.harness.outputs.AUTH_MODE }}
+          # grok auth (staged via run-grok.sh setup): captured X-account OAuth or key,
+          # plus the secrets-write PAT that persists a rotated refresh token back to
+          # GROK_CREDENTIALS (run-grok.sh §2b).
+          GROK_CREDENTIALS: ${{ secrets.GROK_CREDENTIALS }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GH_SECRETS_PAT: ${{ secrets.GH_SECRETS_PAT }}
+          GH_GLOBAL: ${{ secrets.GH_GLOBAL }}
+          GROK_OAUTH_SKEW: ${{ vars.GROK_OAUTH_SKEW }}
+          # Provider credentials — restored (OAuth captures) or written into the
+          # harness's config (API keys). All land in the runner's ephemeral $HOME.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
+          KIMI_AUTH: ${{ secrets.KIMI_AUTH }}
+          HERMES_AUTH: ${{ secrets.HERMES_AUTH }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+          VERCEL_OIDC_TOKEN: ${{ secrets.VERCEL_OIDC_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          # Tier-2 harness tracing gates the otel-cli install below on these.
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          bash scripts/install-harness.sh "$H"
+          # Stage otel-cli for Tier-2 harness spans (no-op unless telemetry is on).
+          bash scripts/install-otel-cli.sh
+
+      # Stage the Buzz CLI for the Buzz notify channel — instant no-op unless
+      # BUZZ_PRIVATE_KEY is set. Set BUZZ_CLI_URL (var) to a prebuilt binary to skip
+      # the from-source build.
+      - name: Stage Buzz CLI
+        if: steps.msg.outputs.source != ''
+        env:
+          BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_PRIVATE_KEY }}
+          BUZZ_CLI_URL: ${{ vars.BUZZ_CLI_URL }}
+          BUZZ_CLI_REF: ${{ vars.BUZZ_CLI_REF }}
+        run: |
+          set -euo pipefail
+          bash scripts/install-buzz-cli.sh
+
+      - name: Run
+        id: run
+        if: steps.msg.outputs.source != ''
+        env:
+          # Explicit named secrets (public-repo malicious-workflow-hold safe) for .mcp.json
+          # ${NAME} with no per-name env wiring. Consumed by the MCP preflight
+          # below, then unset before Claude runs so it never reaches skill code.
+          ALL_SECRETS: >-
+            {"ADMANAGE_API_KEY":${{ toJSON(secrets.ADMANAGE_API_KEY) }},"AI_GATEWAY_API_KEY":${{ toJSON(secrets.AI_GATEWAY_API_KEY) }},"ALCHEMY_API_KEY":${{ toJSON(secrets.ALCHEMY_API_KEY) }},"ANTHROPIC_API_KEY":${{ toJSON(secrets.ANTHROPIC_API_KEY) }},"ANTHROPIC_OAUTH_TOKEN":${{ toJSON(secrets.ANTHROPIC_OAUTH_TOKEN) }},"BANKR_API_KEY":${{ toJSON(secrets.BANKR_API_KEY) }},"BANKR_LLM_KEY":${{ toJSON(secrets.BANKR_LLM_KEY) }},"BASESCAN_API_KEY":${{ toJSON(secrets.BASESCAN_API_KEY) }},"BASE_RPC_URL":${{ toJSON(secrets.BASE_RPC_URL) }},"BEAMR_GATEWAY_URL":${{ toJSON(secrets.BEAMR_GATEWAY_URL) }},"BEAMR_PAYER_KEY":${{ toJSON(secrets.BEAMR_PAYER_KEY) }},"CLAUDE_CODE_OAUTH_TOKEN":${{ toJSON(secrets.CLAUDE_CODE_OAUTH_TOKEN) }},"CODEX_AUTH":${{ toJSON(secrets.CODEX_AUTH) }},"COINGECKO_API_KEY":${{ toJSON(secrets.COINGECKO_API_KEY) }},"DISCORD_BOT_TOKEN":${{ toJSON(secrets.DISCORD_BOT_TOKEN) }},"DISCORD_CHANNEL_ID":${{ toJSON(secrets.DISCORD_CHANNEL_ID) }},"DISCORD_WEBHOOK_URL":${{ toJSON(secrets.DISCORD_WEBHOOK_URL) }},"ETHERSCAN_API_KEY":${{ toJSON(secrets.ETHERSCAN_API_KEY) }},"FLEET_ENDPOINT":${{ toJSON(secrets.FLEET_ENDPOINT) }},"FLEET_TOKEN":${{ toJSON(secrets.FLEET_TOKEN) }},"GH_GLOBAL":${{ toJSON(secrets.GH_GLOBAL) }},"GH_READ_PAT":${{ toJSON(secrets.GH_READ_PAT) }},"GH_SECRETS_PAT":${{ toJSON(secrets.GH_SECRETS_PAT) }},"GITHUB_TOKEN":${{ toJSON(secrets.GITHUB_TOKEN) }},"GROK_CREDENTIALS":${{ toJSON(secrets.GROK_CREDENTIALS) }},"HOOK_DEPLOYER_PRIVATE_KEY":${{ toJSON(secrets.HOOK_DEPLOYER_PRIVATE_KEY) }},"KIMI_AUTH":${{ toJSON(secrets.KIMI_AUTH) }},"LANGFUSE_PUBLIC_KEY":${{ toJSON(secrets.LANGFUSE_PUBLIC_KEY) }},"LANGFUSE_SECRET_KEY":${{ toJSON(secrets.LANGFUSE_SECRET_KEY) }},"MISTRAL_API_KEY":${{ toJSON(secrets.MISTRAL_API_KEY) }},"MOONSHOT_API_KEY":${{ toJSON(secrets.MOONSHOT_API_KEY) }},"NOTIFY_EMAIL_TO":${{ toJSON(secrets.NOTIFY_EMAIL_TO) }},"OPENAI_API_KEY":${{ toJSON(secrets.OPENAI_API_KEY) }},"OPENROUTER_API_KEY":${{ toJSON(secrets.OPENROUTER_API_KEY) }},"PAGESPEED_API_KEY":${{ toJSON(secrets.PAGESPEED_API_KEY) }},"REPLICATE_API_TOKEN":${{ toJSON(secrets.REPLICATE_API_TOKEN) }},"RESEND_API_KEY":${{ toJSON(secrets.RESEND_API_KEY) }},"RESEND_FROM":${{ toJSON(secrets.RESEND_FROM) }},"RESEND_REPLY_TO":${{ toJSON(secrets.RESEND_REPLY_TO) }},"SLACK_BOT_TOKEN":${{ toJSON(secrets.SLACK_BOT_TOKEN) }},"SLACK_CHANNEL_ID":${{ toJSON(secrets.SLACK_CHANNEL_ID) }},"SLACK_WEBHOOK_URL":${{ toJSON(secrets.SLACK_WEBHOOK_URL) }},"SURPLUS_API_KEY":${{ toJSON(secrets.SURPLUS_API_KEY) }},"TELEGRAM_BOT_TOKEN":${{ toJSON(secrets.TELEGRAM_BOT_TOKEN) }},"TELEGRAM_CHAT_ID":${{ toJSON(secrets.TELEGRAM_CHAT_ID) }},"USEPOD_TOKEN":${{ toJSON(secrets.USEPOD_TOKEN) }},"VENICE_API_KEY":${{ toJSON(secrets.VENICE_API_KEY) }},"VERCEL_OIDC_TOKEN":${{ toJSON(secrets.VERCEL_OIDC_TOKEN) }},"VERCEL_TOKEN":${{ toJSON(secrets.VERCEL_TOKEN) }},"XAI_API_KEY":${{ toJSON(secrets.XAI_API_KEY) }},"YDC_API_KEY":${{ toJSON(secrets.YDC_API_KEY) }}}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
+          # Mainnet opt-in lock for deploy-uni-hook (repo variable, not a secret -
+          # a secret value of "1" masks every "1" in the log). See aeon.yml.
+          HOOK_MAINNET_OK: ${{ vars.HOOK_MAINNET_OK }}
+          BANKR_LLM_KEY: ${{ secrets.BANKR_LLM_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          USEPOD_TOKEN: ${{ secrets.USEPOD_TOKEN }}
+          VENICE_API_KEY: ${{ secrets.VENICE_API_KEY }}
+          SURPLUS_API_KEY: ${{ secrets.SURPLUS_API_KEY }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+          OPENROUTER_MODEL_SONNET: ${{ vars.OPENROUTER_MODEL_SONNET }}
+          OPENROUTER_MODEL_HAIKU: ${{ vars.OPENROUTER_MODEL_HAIKU }}
+          USEPOD_MODEL: ${{ vars.USEPOD_MODEL }}
+          USEPOD_MODEL_SONNET: ${{ vars.USEPOD_MODEL_SONNET }}
+          USEPOD_MODEL_HAIKU: ${{ vars.USEPOD_MODEL_HAIKU }}
+          VENICE_MODEL: ${{ vars.VENICE_MODEL }}
+          VENICE_BASE_URL: ${{ vars.VENICE_BASE_URL }}
+          VENICE_CLEANCACHE: ${{ vars.VENICE_CLEANCACHE }}
+          SURPLUS_MODEL: ${{ vars.SURPLUS_MODEL }}
+          GLM_MODEL: ${{ vars.GLM_MODEL }}
+          CCR_LOG: ${{ vars.CCR_LOG }}
+          # Optional Langfuse observability — traces the conversational-reply run
+          # (scripts/langfuse-otel.sh; no-op unless both LANGFUSE_* keys are set).
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_HOST: ${{ vars.LANGFUSE_HOST }}
+          LANGFUSE_TRACING: ${{ vars.LANGFUSE_TRACING }}
+          LANGFUSE_LOG_CONTENT: ${{ vars.LANGFUSE_LOG_CONTENT }}
+          # Optional raw OTLP target for the non-claude harnesses (Tier-2 gen_ai
+          # spans). When Langfuse keys are set, langfuse-otel.sh derives the
+          # endpoint instead — leave these unset.
+          OTEL_EXPORTER_OTLP_ENDPOINT: ${{ vars.OTEL_EXPORTER_OTLP_ENDPOINT }}
+          OTEL_EXPORTER_OTLP_HEADERS: ${{ secrets.OTEL_EXPORTER_OTLP_HEADERS }}
+          OTEL_SERVICE_NAME: ${{ vars.OTEL_SERVICE_NAME }}
+          GITHUB_TOKEN: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Buzz channel — ./notify signs + publishes via the buzz CLI (staged by
+          # "Stage Buzz CLI"); no-ops without BUZZ_PRIVATE_KEY.
+          BUZZ_PRIVATE_KEY: ${{ secrets.BUZZ_PRIVATE_KEY }}
+          BUZZ_CHANNEL_ID: ${{ secrets.BUZZ_CHANNEL_ID }}
+          BUZZ_RELAY_URL: ${{ vars.BUZZ_RELAY_URL }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GROK_CREDENTIALS: ${{ secrets.GROK_CREDENTIALS }}   # grok harness: X-account OAuth (restored by run-grok.sh)
+          GH_SECRETS_PAT: ${{ secrets.GH_SECRETS_PAT }}   # persist rotated grok refresh token → GROK_CREDENTIALS (run-grok.sh §2b)
+          GH_GLOBAL: ${{ secrets.GH_GLOBAL }}
+          GROK_OAUTH_SKEW: ${{ vars.GROK_OAUTH_SKEW }}   # force grok OAuth refresh + persist every run when set large (durability check)
+          # Resolved by the "Resolve harness" step above; the CLI they name was
+          # staged by "Install harness CLI".
+          HARNESS: ${{ steps.harness.outputs.HARNESS }}
+          AUTH_MODE: ${{ steps.harness.outputs.AUTH_MODE }}
+          MODEL_ARG: ${{ steps.harness.outputs.MODEL_ARG }}
+          # Provider keys the non-claude harnesses read at RUN time (pi picks its
+          # provider from whichever is in env; codex/kimi/vibe read the key their
+          # staged config names). OPENROUTER_API_KEY is already declared above.
+          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
+          KIMI_AUTH: ${{ secrets.KIMI_AUTH }}
+          HERMES_AUTH: ${{ secrets.HERMES_AUTH }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+          VERCEL_OIDC_TOKEN: ${{ secrets.VERCEL_OIDC_TOKEN }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+          _MSG_SOURCE: ${{ steps.msg.outputs.source }}
+          _MSG_MESSAGE: ${{ steps.msg.outputs.message }}
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          CONFIG_MODEL=$(grep -E '^model:' aeon.yml | sed 's/^model: *//' | tr -d ' ')
+          MODEL="${CONFIG_MODEL:-claude-sonnet-5}"
+
+          # HARNESS / AUTH_MODE / MODEL_ARG come from the "Resolve harness" step
+          # (scripts/resolve-harness.sh), and the CLI was staged by "Install harness
+          # CLI" — so all seven answer messages now. This used to be an inline
+          # claude-or-grok resolution here that downgraded the other five to claude
+          # with a ::warning::, because nothing on this workflow could install them.
+          # On grok a claude-* model id is meaningless — fall back to grok's default.
+          if [ "$HARNESS" = "grok" ]; then
+            case "$MODEL" in claude-*|"") MODEL="grok-4.5" ;; esac
+          fi
+          echo "Using harness: $HARNESS  |  auth: $AUTH_MODE  |  model: ${MODEL_ARG:-$MODEL}"
+
+          # AI Gateway routing — same path as aeon.yml's Run step, and gated the
+          # same way: it is Anthropic-specific (llm-gateway.sh rewrites
+          # ANTHROPIC_BASE_URL/model env), so ONLY claude sources it. This used to
+          # read `!= grok`, which was correct while claude and grok were the only
+          # two possible harnesses; with codex/pi/vibe/kimi reachable it would
+          # point their env at an Anthropic gateway they never call.
+          if [ "$HARNESS" = "claude" ]; then
+            GATEWAY=$(grep -A1 '^gateway:' aeon.yml | grep 'provider:' | sed 's/.*provider:[[:space:]]*//' | sed "s/[\"' ]//g" || true)
+            GATEWAY="${GATEWAY:-auto}"
+            source "${GITHUB_WORKSPACE}/scripts/llm-gateway.sh"
+            AEON_OTEL_COMPONENT=message source "${GITHUB_WORKSPACE}/scripts/langfuse-otel.sh"
+          fi
+
+          cat > ./notify << 'NOTIFY_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # Conversational-reply notify. Supports the same interactive flags as the
+          # canonical scripts/notify.sh (--buttons / --force-reply / --placeholder /
+          # --context) so Claude can attach buttons or ask a force_reply follow-up.
+          MSG=""; BUTTONS_JSON=""; FORCE_REPLY=""; PLACEHOLDER=""; CONTEXT=""; have_body=false
+          while [ $# -gt 0 ]; do
+            case "$1" in
+              --buttons)     BUTTONS_JSON="${2:-}"; shift 2 ;;
+              --force-reply) FORCE_REPLY=1; shift ;;
+              --placeholder) PLACEHOLDER="${2:-}"; shift 2 ;;
+              --context)     CONTEXT="${2:-}"; shift 2 ;;
+              --title|--severity|--link|--mute-key) shift 2 ;;
+              -f|--file|--body) MSG=$(cat "${2:-/dev/null}" 2>/dev/null || true); have_body=true; shift 2 ;;
+              *) if [ "$have_body" = false ]; then MSG="$1"; have_body=true; fi; shift ;;
+            esac
+          done
+          [ -n "$CONTEXT" ] && MSG="[$CONTEXT] $MSG"
+          RM="null"
+          if [ -n "$BUTTONS_JSON" ]; then
+            RM=$(jq -n --argjson kb "$BUTTONS_JSON" '{inline_keyboard:$kb}' 2>/dev/null || echo null)
+          elif [ -n "$FORCE_REPLY" ]; then
+            RM=$(jq -n --arg p "$PLACEHOLDER" '{force_reply:true} + (if $p!="" then {input_field_placeholder:$p} else {} end)')
+          fi
+          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+            curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg chat "$TELEGRAM_CHAT_ID" --arg text "$MSG" --argjson rm "$RM" '{chat_id: $chat, text: $text, parse_mode: "Markdown"} + (if $rm then {reply_markup: $rm} else {} end)')" > /dev/null || true
+          fi
+          if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
+            curl -sf -X POST "$DISCORD_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg text "$MSG" '{content: $text}')" > /dev/null || true
+          fi
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg text "$MSG" '{text: $text}')" > /dev/null || true
+          fi
+          NOTIFY_SCRIPT
+          chmod +x ./notify
+
+          ALLOWED="Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
+          ALLOWED="$ALLOWED,Bash(curl:*),Bash(gh:*),Bash(git:*),Bash(jq:*)"
+          ALLOWED="$ALLOWED,Bash(./notify:*)"
+          ALLOWED="$ALLOWED,Bash(mkdir:*),Bash(ls:*),Bash(cat:*),Bash(chmod:*)"
+          ALLOWED="$ALLOWED,Bash(date:*),Bash(echo:*),Bash(node:*),Bash(npm:*),Bash(npx:*)"
+          ALLOWED="$ALLOWED,Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(sort:*),Bash(grep:*)"
+
+          # MCP (opt-in): when a project .mcp.json exists, load it for this run
+          # and allow each server's tools. No-op when the file is absent. Any
+          # ${VAR} the config references is auto-resolved from this repo's secrets
+          # (ALL_SECRETS) — set the secret in the dashboard and it just works, no
+          # per-name workflow wiring. If a referenced secret genuinely isn't set,
+          # skip MCP with a warning rather than break the run on a parse failure.
+          MCP_FLAGS=()
+          if [ -f .mcp.json ] && jq -e '.mcpServers' .mcp.json >/dev/null 2>&1; then
+            # MCP OAuth (durable): refresh any captured OAuth access token BEFORE the
+            # ${VAR} loop (exports a live MCP_<SLUG>_TOKEN). Sourced; never fails the
+            # run. See scripts/mcp-oauth-refresh.sh.
+            if [ -f "${GITHUB_WORKSPACE}/scripts/mcp-oauth-refresh.sh" ]; then
+              source "${GITHUB_WORKSPACE}/scripts/mcp-oauth-refresh.sh" || true
+            fi
+            MCP_MISSING=""
+            # ALL_SECRETS is toJSON(secrets). Guard the empty case via a temp var —
+            # NOT the inline ${ALL_SECRETS:-{}} form: bash closes ${...} at the first
+            # '}', so the default is just '{' and a stray '}' gets appended to the
+            # value, corrupting the JSON (jq: parse error "Unmatched '}'").
+            SECRETS_JSON="${ALL_SECRETS:-}"; [ -z "$SECRETS_JSON" ] && SECRETS_JSON='{}'
+            for v in $(grep -oE '\$\{[A-Z_][A-Z0-9_]*\}' .mcp.json | sed -E 's/[${}]//g' | sort -u); do
+              [ -n "${!v:-}" ] && continue                                  # already in env (built-in)
+              val="$(jq -r --arg k "$v" '.[$k] // empty' <<<"$SECRETS_JSON")"
+              if [ -n "$val" ]; then export "$v=$val"; else MCP_MISSING="$MCP_MISSING $v"; fi
+            done
+            if [ -n "$MCP_MISSING" ]; then
+              echo "::warning::.mcp.json references secret(s) not set:${MCP_MISSING} — add them in the dashboard; the next run picks them up. Skipping MCP this run."
+            else
+              for srv in $(jq -r '.mcpServers | keys[]' .mcp.json); do
+                ALLOWED="$ALLOWED,mcp__${srv}"
+              done
+              MCP_FLAGS=(--mcp-config .mcp.json --strict-mcp-config)
+              echo "MCP enabled: $(jq -r '.mcpServers | keys | join(", ")' .mcp.json)"
+            fi
+          fi
+          unset ALL_SECRETS   # drop the secrets blob before any skill/Claude code runs
+
+          SOURCE="$_MSG_SOURCE"
+          MESSAGE="$_MSG_MESSAGE"
+          PROMPT="Today is $TODAY. You received this message from the user on ${SOURCE}:
+
+          \"$MESSAGE\"
+
+          Read memory/MEMORY.md for context. Look at the available skills in skills/ to understand what you can do.
+
+          Interpret what the user wants and act on it:
+          - If they want you to run a skill (e.g. \"write an article about X\", \"send me a digest\"), read that skill file and execute it.
+          - If they want information or have a question, research it and respond.
+          - If they want you to remember something, update memory/MEMORY.md.
+          - For anything else, do your best and explain what you did.
+
+          Always send your response back via ./notify so the user sees it."
+          # Unified execution: EVERY harness runs through harness-adapter's
+          # run-harness, the same way aeon.yml runs a skill — one
+          # {result, usage{...}} envelope, so the token/notify handling below is
+          # unchanged. This is the point of the change: fixes that live in the
+          # adapter now apply here too. Previously this path called
+          # scripts/run-grok.sh directly and bypassed the adapter entirely, which
+          # is why grok's MCP folder-trust gate stayed broken on inbound messages
+          # after it was fixed for skill runs (#779 → #781).
+          #
+          # Write mode: a conversational reply can run skills, update memory and
+          # notify. run-harness applies its OS sandbox only to read-only runs, so
+          # there is nothing to opt out of here.
+          RH="${GITHUB_WORKSPACE}/harness-adapter/run-harness"
+          RH_ARGS=(--mode write --allowed-tools "$ALLOWED" --timeout 600)
+          # Pass --mcp-config only when the preflight actually ENABLED MCP (every
+          # referenced ${VAR} resolved) — MCP_FLAGS doubles as that gate.
+          # run-harness re-expands the config and translates it per harness; the
+          # claude adapter adds --strict-mcp-config itself, as this step used to.
+          if [ "${#MCP_FLAGS[@]}" -gt 0 ]; then RH_ARGS+=(--mcp-config .mcp.json); fi
+          # Which --model to forward, mirroring aeon.yml's Run step. aeon's own ids
+          # are claude-*/grok-*, which mean nothing to an OpenRouter-backed CLI:
+          # forwarding one there leaves the harness on its default while every
+          # record names a model that never ran. MODEL_ARG (from resolve-harness.sh)
+          # is already the right value or empty for "the staged config decides" —
+          # vibe and kimi resolve a config ALIAS, so passing --model breaks them.
+          RH_MODEL_ARGS=()
+          case "$HARNESS" in
+            claude) RH_MODEL_ARGS=(--model "$MODEL") ;;
+            grok)   case "$MODEL" in grok-*) RH_MODEL_ARGS=(--model "$MODEL") ;; esac ;;
+            *)      if [ -n "${MODEL_ARG:-}" ]; then RH_MODEL_ARGS=(--model "$MODEL_ARG"); fi ;;
+          esac
+          # Tier-2 harness tracing: claude sourced langfuse-otel.sh above and
+          # self-traces; for the other harnesses export the OTLP env here so
+          # harness-adapter/lib/otel-span.sh emits a gen_ai span. No-op unless
+          # telemetry is configured; `|| true` so it never fails the reply.
+          if [ "$HARNESS" != "claude" ]; then
+            AEON_OTEL_COMPONENT=harness source "${GITHUB_WORKSPACE}/scripts/langfuse-otel.sh" >&2 || true
+          fi
+          HARNESS_ERR=$(mktemp)
+          if ! CLAUDE_OUTPUT=$(echo "$PROMPT" | bash "$RH" "$HARNESS" \
+            "${RH_MODEL_ARGS[@]}" "${RH_ARGS[@]}" 2>"$HARNESS_ERR"); then
+            # Full diagnostic to the step log unconditionally (matches
+            # aeon.yml's Run step) before the short summary — a
+            # tail-c-400-only view previously dropped the actual error
+            # whenever the harness's JSON result envelope put the
+            # diagnostic fields (is_error/api_error_status/result) before
+            # the trailing usage/modelUsage/uuid boilerplate, which is the
+            # common case.
+            tail -c 4000 "$HARNESS_ERR" >&2 || true
+            echo "::error::$HARNESS harness failed: $(tail -c 400 "$HARNESS_ERR" | tr '\n' ' ')"
+            exit 1
+          fi
+          # run-harness diagnostics are the only signal when a harness degrades but
+          # still exits 0 (a skipped MCP server, a token-estimate fallback), so
+          # surface them in the job log rather than swallowing them.
+          if [ -s "$HARNESS_ERR" ]; then sed 's/^/run-harness: /' "$HARNESS_ERR" >&2; fi
+          rm -f "$HARNESS_ERR"
+
+          echo "$CLAUDE_OUTPUT" | jq -r '.result // empty'
+
+          INPUT_TOKENS=$(echo "$CLAUDE_OUTPUT" | jq '.usage.input_tokens // 0')
+          OUTPUT_TOKENS=$(echo "$CLAUDE_OUTPUT" | jq '.usage.output_tokens // 0')
+          CACHE_READ=$(echo "$CLAUDE_OUTPUT" | jq '.usage.cache_read_input_tokens // 0')
+          CACHE_CREATION=$(echo "$CLAUDE_OUTPUT" | jq '.usage.cache_creation_input_tokens // 0')
+          TOTAL_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS))
+
+          echo "SKILL_INPUT_TOKENS=$INPUT_TOKENS" >> "$GITHUB_OUTPUT"
+          echo "SKILL_OUTPUT_TOKENS=$OUTPUT_TOKENS" >> "$GITHUB_OUTPUT"
+          echo "SKILL_CACHE_READ_TOKENS=$CACHE_READ" >> "$GITHUB_OUTPUT"
+          echo "SKILL_CACHE_CREATION_TOKENS=$CACHE_CREATION" >> "$GITHUB_OUTPUT"
+          echo "SKILL_TOTAL_TOKENS=$TOTAL_TOKENS" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Token usage — input: $INPUT_TOKENS, output: $OUTPUT_TOKENS, cache_read: $CACHE_READ, cache_creation: $CACHE_CREATION, total: $TOTAL_TOKENS"
+
+      # Sidecar gateway logs die with the VM — surface them in the job log on
+      # failure (set the CCR_LOG=true repo variable for request-level detail).
+      # The ccr config.json is deliberately NOT printed (it embeds the provider key).
+      - name: Sidecar logs (on failure)
+        if: failure()
+        run: |
+          found=0
+          for f in "$HOME"/.claude-code-router/logs/*.log "$HOME"/.claude-code-router/*.log; do
+            [ -f "$f" ] || continue
+            found=1
+            echo "===== ${f} (last 200 lines) ====="
+            tail -n 200 "$f"
+          done
+          if [ "$found" -eq 0 ]; then echo "No claude-code-router logs found (gateway was not a sidecar provider, or it never started)."; fi
+
+      - name: Log token usage
+        if: steps.msg.outputs.source != ''
+        env:
+          _LOG_SOURCE: ${{ steps.msg.outputs.source }}
+          _LOG_INPUT: ${{ steps.run.outputs.SKILL_INPUT_TOKENS }}
+          _LOG_OUTPUT: ${{ steps.run.outputs.SKILL_OUTPUT_TOKENS }}
+          _LOG_CACHE_READ: ${{ steps.run.outputs.SKILL_CACHE_READ_TOKENS }}
+          _LOG_CACHE_CREATION: ${{ steps.run.outputs.SKILL_CACHE_CREATION_TOKENS }}
+          _LOG_TOTAL: ${{ steps.run.outputs.SKILL_TOTAL_TOKENS }}
+        run: |
+          SOURCE="$_LOG_SOURCE"
+          INPUT="$_LOG_INPUT"
+          OUTPUT="$_LOG_OUTPUT"
+          CACHE_READ="$_LOG_CACHE_READ"
+          CACHE_CREATION="$_LOG_CACHE_CREATION"
+          TOTAL="$_LOG_TOTAL"
+          echo "## Token Usage: message ($SOURCE)" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Tokens |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Input | $INPUT |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Output | $OUTPUT |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Cache read | $CACHE_READ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Cache creation | $CACHE_CREATION |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Total** | **$TOTAL** |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit results
+        if: steps.msg.outputs.source != ''
+        env:
+          _COMMIT_SOURCE: ${{ steps.msg.outputs.source }}
+        run: |
+          git config user.name "aeonframework"
+          git config user.email "aeonframework@proton.me"
+          rm -f ./notify
+
+          CURRENT_BRANCH=$(git branch --show-current)
+          SOURCE="$_COMMIT_SOURCE"
+
+          if [ "$CURRENT_BRANCH" != "main" ] && [ -n "$CURRENT_BRANCH" ]; then
+            echo "On feature branch: $CURRENT_BRANCH"
+            git add -A
+            git diff --staged --quiet || git commit -m "chore($SOURCE): auto-commit $(date +%Y-%m-%d)"
+            git push --force-with-lease -u origin "$CURRENT_BRANCH" || true
+
+            git checkout -f main
+            git pull --rebase origin main || true
+          fi
+
+          git add -A
+          git diff --staged --quiet && exit 0
+          git commit -m "chore($SOURCE): auto-commit $(date +%Y-%m-%d)"
+          JITTER=$((RANDOM % 10))
+          echo "Waiting ${JITTER}s jitter before push..."
+          sleep "$JITTER"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase origin main; then
+              git push -u origin HEAD && exit 0
+            else
+              echo "Rebase conflict on attempt $i, auto-resolving..."
+              for f in $(git diff --name-only --diff-filter=U); do
+                if [[ "$f" == memory/logs/* ]] || [[ "$f" == memory/topics/* ]] || [[ "$f" == memory/MEMORY.md ]]; then
+                  sed -i '/^<<<<<<< /d; /^=======/d; /^>>>>>>> /d' "$f"
+                  git add "$f"
+                else
+                  git checkout --theirs "$f"
+                  git add "$f"
+                fi
+              done
+              if git diff --cached --quiet; then
+                git rebase --skip
+              else
+                GIT_EDITOR=true git rebase --continue
+              fi
+            fi
+            BACKOFF=$(( (2 ** i) + RANDOM % 5 ))
+            echo "Push attempt $i failed, retrying in ${BACKOFF}s..."
+            sleep "$BACKOFF"
+          done
+          echo "Failed to push after 5 attempts"
+          exit 1
