@@ -1,0 +1,286 @@
+<p align="center">
+  <img src="../docs/assets/hero-animated.svg" alt="AEON - the most autonomous agent framework. 85 skills across 9 harnesses (Claude Code, Grok, Codex, Pi, Vibe, Kimi, fx, Cursor, Hermes), running unattended on GitHub Actions: it ships features to your repos, privately discloses real vulnerabilities, deploys live apps, runs deep research, and writes new skills for itself. Keywords: autonomous AI agent, agent framework, GitHub Actions automation, self-improving agent, multi-agent orchestration, LLM skills, cron agent." width="100%" />
+</p>
+
+<p align="center">
+  <strong>Star us&nbsp;❤️&nbsp;→</strong>&nbsp;&nbsp;
+  <a href="https://www.aeon.fun/connect"><img src="../docs/assets/btn-run.svg" alt="Run now: start your Aeon agent in the browser with Aeon Connect" height="34" align="absmiddle"></a>&nbsp;&nbsp;
+  <a href="https://github.com/aeonfun/aeon/stargazers"><img src="../docs/assets/btn-star.svg" alt="Star Aeon on GitHub" height="34" align="absmiddle"></a>&nbsp;&nbsp;
+  <a href="https://www.aeon.fun"><img src="../docs/assets/btn-site.svg" alt="aeon.fun" height="34" align="absmiddle"></a>&nbsp;&nbsp;
+  <a href="https://www.aeon.fun/docs"><img src="../docs/assets/btn-docs.svg" alt="Aeon docs" height="34" align="absmiddle"></a>&nbsp;&nbsp;
+  <a href="https://x.com/aeonframework"><img src="../docs/assets/btn-x.svg" alt="@aeonframework on X" height="34" align="absmiddle"></a>&nbsp;&nbsp;
+  <a href="https://bankr.bot/discover/0xbf8e8f0e8866a7052f948c16508644347c57aba3"><img src="../docs/assets/btn-bankr.svg" alt="$aeon on Bankr" height="34" align="absmiddle"></a>
+</p>
+
+<p align="center">
+  Give it a direction and it ships the work: features, vulnerability disclosures, live apps, deep research - and new skills for itself.<br/><br/>
+  <strong>No approval loops. No babysitting. Configure once, forget forever.</strong>
+</p>
+
+> **▶ Start in your browser:** **[www.aeon.fun/connect](https://www.aeon.fun/connect)** - sign in with GitHub, connect a model, pick skills. No clone, no terminal.
+>
+> **🤖 Using a coding agent?** Point it here: **read https://www.aeon.fun/skills/aeon.md and follow the instructions to set up your Aeon agent.**
+
+<div align="center">
+
+[![stars](https://img.shields.io/github/stars/aeonfun/aeon?style=flat-square&label=stars&color=F4EFE1&labelColor=0d0c0a&logo=github&logoColor=F4EFE1)](https://github.com/aeonfun/aeon/stargazers)
+[![forks](https://img.shields.io/github/forks/aeonfun/aeon?style=flat-square&label=forks&color=F4EFE1&labelColor=0d0c0a&logo=github&logoColor=F4EFE1)](https://github.com/aeonfun/aeon/network/members)
+[![license](https://img.shields.io/badge/license-MIT-F4EFE1?style=flat-square&labelColor=0d0c0a)](../LICENSE)
+[![node](https://img.shields.io/badge/node-20+-F4EFE1?style=flat-square&labelColor=0d0c0a)](https://nodejs.org/)
+
+</div>
+
+<p align="center">
+  <img src="../docs/assets/aeon-demo.gif" alt="Aeon live demo — the dashboard configures skills, schedules them on cron, and Aeon runs unattended: shipping PRs, disclosing vulnerabilities, and reporting back to your channels." />
+</p>
+
+---
+
+## Quick start
+
+<p align="center">
+  <img src="../docs/assets/quickstart-aeon.jpg" alt="Quick start in four steps: Sign in, Connect, Pick, Run. 1 Sign in - log in with GitHub at www.aeon.fun/connect and get your own repo. 2 Connect - connect a model, such as your Claude subscription. 3 Pick skills - toggle skills on and set their schedule. 4 Runs itself - Aeon runs unattended on GitHub Actions." width="100%" />
+</p>
+
+**In your browser (recommended): [Aeon Connect](https://www.aeon.fun/connect).** Sign in with GitHub at **[www.aeon.fun/connect](https://www.aeon.fun/connect)** and click **Create your aeon**: it makes **your own repo** (public = a fork of `aeonfun/aeon`, free Actions minutes; private = a copy, on your own minutes) and turns GitHub Actions on. Install the [Aeon Connect GitHub App](https://github.com/apps/aeon-connect) on that one repo (GitHub's page opens with it pre-selected), then **connect a model** (a Claude subscription token from `claude setup-token`, an API key, a ChatGPT login, or OpenRouter in one click), **pick skills**, and press **Run**. Keys go straight into your repo's encrypted secrets; Aeon Connect only hosts the dashboard, and every run happens on your own GitHub Actions.
+
+**Using a coding agent?** Paste this into Claude Code, Codex, Hermes or OpenClaw: `read https://www.aeon.fun/skills/aeon.md and follow the instructions to set up your aeon agent`.
+
+<details>
+<summary><strong>Prefer the terminal?</strong></summary>
+
+You need **Node.js 20+** and the **[GitHub CLI](https://cli.github.com/) (`gh`)**. Then:
+
+```bash
+git clone https://github.com/aeonfun/aeon && cd aeon
+./aeon init
+```
+
+`./aeon init` does the rest and tells you what it did at each step: signs you in to GitHub, creates **your own repo** from the template (public by default - Actions minutes are free; `--private` if you prefer), points this folder and `gh` at it, turns on GitHub Actions, stores your GitHub token for runs, connects a model (any of nine [harnesses](../docs/harnesses.md): a Claude subscription, an API key, or one OpenRouter key) and, if you want, links Telegram. It is safe to re-run: every step checks first and skips what is already done. Then `./aeon` opens the same dashboard locally at [localhost:5555](http://localhost:5555) to **pick skills** and **Run**. `bin/onboard` re-checks the whole setup any time (read-only).
+
+</details>
+
+<details>
+<summary><strong>Prefer to do it by hand?</strong></summary>
+
+1. Click **Use this template** on [the repo page](https://github.com/aeonfun/aeon) (keep it public; Actions minutes are free). A template copy starts with GitHub Actions on. If you fork by hand instead, open the fork's **Actions** tab and enable workflows first: a fork starts with Actions off and its schedules never fire until you do. ([Aeon Connect](https://www.aeon.fun/connect) forks public instances and turns Actions on for you.)
+2. Clone it and point `gh` at it - without this, secrets you set land on `aeonfun/aeon` instead of your repo:
+
+   ```bash
+   gh auth login --web -s workflow
+   git clone https://github.com/<you>/aeon && cd aeon
+   gh repo set-default <you>/aeon
+   ./aeon
+   ```
+
+3. In the dashboard: **Connect a model** -> **add a channel** -> **pick skills** -> **Run**.
+
+Everything is also an `./aeon` command ([CLI](../apps/cli/README.md)) or a `/aeon` chat command ([setup skill](../docs/aeon-setup.md), installable as a [Claude Code or Codex plugin](../docs/aeon-setup.md#install)). For skills that reach other repos, add a classic PAT with `repo` + `workflow` as `GH_GLOBAL` ([details](../docs/CONFIGURATION.md#cross-repo-access)).
+
+</details>
+
+<details>
+<summary><strong>No admin rights / can't install <code>gh</code>?</strong></summary>
+
+You don't need either: [Aeon Connect](https://www.aeon.fun/connect) sets everything up from the browser. For the terminal path, grab the `gh_*_macOS_arm64.zip` (or your platform's binary) from [github.com/cli/cli/releases](https://github.com/cli/cli/releases) and drop it on your `PATH` (e.g. `~/.local/bin`). Then `gh auth login`.
+
+</details>
+
+---
+
+## What Aeon can do
+
+<p align="center">
+  <img src="../docs/assets/what-aeon-does.jpg" alt="A skill is just a file — an Aeon skill is a single SKILL.md: a small frontmatter block (title, category, status) then a plain-language prompt. That one file fans out into real capabilities: launch, deploy, web fetch, and search." width="100%" />
+</p>
+
+**A skill is a Markdown file: some frontmatter, then a prompt.** Here's a real one, trimmed:
+
+```yaml
+# skills/digest/SKILL.md
+---
+name: digest
+description: Generate and send a digest on a configurable topic
+metadata:
+  title: Digest
+  mode: write
+  category: basics               # which pack it belongs to
+  var: ""                        # per-run input - "solana", "rust", "AI agents"…
+  requires:
+    - XAI_API_KEY?               # ? = optional key, bare = required
+---
+```
+
+The prompt *is* the skill. You schedule it, hand it a `var`, chain it into others, and a cheap model rates every run (Haiku on Claude). How packs work: [`docs/skill-packs.md`](../docs/skill-packs.md).
+
+<p align="center">
+  <img src="../docs/assets/packs-aeon.jpg" alt="Six skill packs, 85 skills total: Core (fleet coordination, self-config, liveness), Evolution (authors and heals its own skills), Basics (simple runnable skills), Dev & Code, Crypto & Markets, and Productivity." width="100%" />
+</p>
+
+<p align="center"><a href="../docs/skill-packs.md#full-catalog-all-85-skills-by-pack"><b>Full catalog - all 85 skills by pack →</b></a></p>
+
+<p align="center"><a href="../docs/community-skill-packs.md#listed-packs"><b>Community skill packs →</b></a></p>
+
+## Support nine harnesses: Claude, Grok, Codex, Pi, Vibe, Kimi, fx, Cursor, Hermes
+
+<p align="center">
+  <img src="../docs/assets/harnesses-aeon.jpg" alt="Nine engines, one socket - a SKILL.md flows through run-harness into any of nine agent CLIs: Claude, Grok, Codex, Pi, Vibe, Kimi, fx, Cursor, Hermes. Every harness honors the same contract: result, usage, session." width="100%" />
+</p>
+
+The same `SKILL.md` runs on any of nine agent CLIs - **Claude**, **Grok**, **Codex**, **Pi**, **Vibe**, **Kimi**, **fx**, **Cursor**, **Hermes** - behind one `run-harness` contract (same result, usage, and session shape). Swap the harness; nothing else changes. How the contract works: [`docs/harnesses.md`](../docs/harnesses.md). GLM Coding Plan is a Claude AI Gateway hop (`GLM_API_KEY`), not a harness.
+
+## Why "the most autonomous"
+
+Most agent tools keep you in the loop - approve this call, review this diff. Aeon is built for the work you want done while you're away, and it's the only framework that does all four unattended: runs on a schedule, remembers across runs, reacts to conditions, and repairs its own broken skills. The most autonomous agent is the one that never asks.
+
+Full comparison vs Claude Code, Hermes, and OpenClaw: [`SHOWCASE.md`](../docs/SHOWCASE.md).
+
+![Autonomy spectrum](../docs/assets/autonomy-aeon.jpg)
+
+## Proof of work
+
+<p align="center">
+  <img src="../docs/assets/proof-aeon.jpg" alt="Proof of work, live at aeon.fun: 4.7M GitHub stars secured across 100+ open-source repos, 70+ products and agents built on Aeon, and 9 community skill packs." width="100%" />
+</p>
+
+Live at **[aeon.fun](https://www.aeon.fun)**: **4.7M GitHub stars secured** - real vulnerabilities found, patched, and responsibly disclosed across 100+ open-source repos (**Alibaba**, **Tencent**, **Vercel**, and more), many rated High or Critical. **70+ products built on top of Aeon.**
+
+[Every disclosure →](https://www.aeon.fun/security) · [ecosystem](../docs/ECOSYSTEM.md) · [community packs](../docs/community-skill-packs.md#listed-packs)
+
+### It ships real work
+
+<p align="center">
+  <img src="../docs/assets/ships-work-aeon.jpg" alt="It ships real work — four things Aeon does end to end: ships code (PRs to your repos), deploys apps (live to Vercel), finds bugs (real vulnerabilities, privately disclosed), and writes skills (new capabilities from a sentence)." width="100%" />
+</p>
+
+`feature` ships code to your repos, `deploy-prototype` ships live apps to Vercel, `vuln-scanner` finds and privately discloses real vulnerabilities, `create-skill` writes new skills from a sentence. How each works: [`CORE.md`](../docs/CORE.md).
+
+### It heals itself
+
+![It heals itself - a loop that detects failing runs, scores them 1-5, repairs broken skills, and improves them](../docs/assets/skill-run-aeon.jpg)
+
+A model scores every run 1–5; `heartbeat` → `skill-health` → `skill-repair` → `self-improve` detect and fix broken skills without you, and `aeon-doctor` lints the config itself. How the loop closes: [`CORE.md`](../docs/CORE.md).
+
+### It replicates
+
+<p align="center">
+  <img src="../docs/assets/replicates-aeon.jpg" alt="It spawns itself — one Aeon forks into a fleet of specialized instances (crypto, security, research), each its own node with isolated billing and no propagated secrets." width="100%" />
+</p>
+
+`spawn-instance` forks Aeon into a new specialized instance (`var: "crypto-tracker: monitor DeFi protocols"`), picks relevant skills, and registers it - no secrets propagated, billing isolated. `fleet-control` health-checks and dispatches across the fleet.
+
+---
+
+## Guardrails
+
+<p align="center">
+  <img src="../docs/assets/guardrails-aeon.jpg" alt="Autonomy needs brakes — four safety brakes on by default or one flag away: read-only skills can't touch the repo, irreversible actions fail closed, an optional auth gate approves every run, and secrets stay off the command line." width="100%" />
+</p>
+
+Read-only skills can't touch the repo, irreversible actions fail closed, an optional [Fleet Watcher](../docs/CONFIGURATION.md#fleet-watcher-authorization-layer) gates every run, and secrets stay off the command line. Details: [Configuration](../docs/CONFIGURATION.md#capability-tiers-read-only-skills).
+
+---
+
+## Private by design
+
+<p align="center">
+  <img src="../docs/assets/privacy-aeon.jpg" alt="Who holds your data? Muse, Grok, Hermes Cloud and Aeon all run 24/7 in the cloud, but only Aeon keeps your data off the vendor's servers, never trains a vendor model on your chats, and is open source. Aeon: private instance plus your own model key." width="100%" />
+</p>
+
+Muse, Grok, and Hermes Cloud run around the clock too, but on their own servers, and they train on your chats unless you opt out ([Muse](https://www.engadget.com/2256577/how-to-get-started-with-meta-s-new-ai-agent-muse/), [Grok](https://x.ai/legal/faq), [Hermes Cloud](https://portal.nousresearch.com/privacy)). Aeon runs on your own GitHub Actions: memory is files in your repo, keys are your repo's encrypted secrets, there is no Aeon server in the loop, and nothing is sent anywhere unless you point tracing at your own collector. Keep it fully private with a **private** instance ([two-repo strategy](../docs/CONFIGURATION.md#two-repo-strategy)) and your own model key - your model provider's terms still apply.
+
+---
+
+## Configure
+
+<a href="../docs/CONFIGURATION.md"><img src="../docs/assets/never-sleeps-aeon.jpg" alt="Aeon never sleeps - one config, a full day of autonomous runs (UTC): morning aggregation, dev and repo, crypto, content, repo intel, security, social, and evening meta skills on a 24-hour dial" width="100%" /></a>
+
+Everything lives in `aeon.yml` - schedules (standard UTC cron), the per-skill `var` input, model, auth, notification channels, and API keys:
+
+```yaml
+skills:
+  digest:
+    enabled: true
+    schedule: "0 14 * * *"    # daily 2pm UTC
+    var: "solana"             # per-run input
+```
+
+Full reference - scheduling, `var`, models, [authentication](../docs/CONFIGURATION.md#authentication), [notification channels](../docs/CONFIGURATION.md#notifications), API keys, guardrails: **[Configuration](../docs/CONFIGURATION.md)**.
+
+**GitHub permissions:** the built-in `GITHUB_TOKEN` covers same-repo work; add **one classic PAT** as `GH_GLOBAL` with **`repo`** + **`workflow`** scopes to drive every cross-repo, private, disclosure, and workflow-editing skill. No `read:org` / `admin:org`. See [Cross-repo access](../docs/CONFIGURATION.md#cross-repo-access). Set up with [Aeon Connect](https://www.aeon.fun/connect)? The dashboard reaches your repo through the Aeon Connect GitHub App, so no PAT is needed to get going; `GH_GLOBAL` is only for the cross-repo skills above.
+
+---
+
+## Integrate Aeon
+
+An Aeon instance is just a GitHub repo + Actions, so **GitHub's API is Aeon's API** - one GitHub App drives your users' instances (dispatch skills, edit config, write sealed secrets) with no PATs or LLM billing on your side.
+
+Full walkthrough - App setup, tenant isolation, driving skills, shipping your own pack: **[ADK - Aeon Developer Kit](../docs/ADK.md)**.
+
+<div align="center">
+  <img src="../docs/assets/integrate-aeon.png" alt="Integrate Aeon" width="256" />
+</div>
+
+---
+
+## Docs
+
+The deep reference lives in [`docs/`](../docs) - jump in:
+
+<p align="center">
+  <a href="../docs/CONFIGURATION.md"><img src="../docs/assets/doc-config.svg" alt="Configuration - chaining, triggers, scheduler, capability modes, gateways, Fleet Watcher" height="30" align="absmiddle"></a>&nbsp;
+  <a href="../docs/harnesses.md"><img src="../docs/assets/doc-harnesses.svg" alt="Harnesses - run skills on any of nine agent CLIs behind one contract" height="30" align="absmiddle"></a>&nbsp;
+  <a href="../docs/skill-packs.md"><img src="../docs/assets/doc-packs.svg" alt="Skill Packs - how packs work and how to build your own" height="30" align="absmiddle"></a>&nbsp;
+  <a href="../docs/CORE.md"><img src="../docs/assets/doc-core.svg" alt="Core - the self-healing health and repair loop" height="30" align="absmiddle"></a>
+</p>
+<p align="center">
+  <a href="../apps/cli/README.md"><img src="../docs/assets/doc-cli.svg" alt="CLI - the whole dashboard as scriptable ./aeon commands" height="30" align="absmiddle"></a>&nbsp;
+  <a href="../apps/mcp-server/README.md"><img src="../docs/assets/doc-mcp.svg" alt="MCP server - every skill as an aeon MCP tool in Claude" height="30" align="absmiddle"></a>&nbsp;
+  <a href="../apps/webhook/README.md"><img src="../docs/assets/doc-webhooks.svg" alt="Webhooks - ~1s Telegram instant mode via a self-hosted worker" height="30" align="absmiddle"></a>&nbsp;
+  <a href="../docs/ADK.md"><img src="../docs/assets/doc-adk.svg" alt="ADK - build products on top of Aeon over the GitHub API" height="30" align="absmiddle"></a>&nbsp;
+  <a href="../docs/ECOSYSTEM.md"><img src="../docs/assets/doc-ecosystem.svg" alt="Ecosystem - products and agents built on Aeon" height="30" align="absmiddle"></a>
+</p>
+
+---
+
+## Community
+
+<table width="100%" border="0" cellspacing="0" role="presentation">
+  <tr>
+    <td align="center" valign="middle" width="33%">
+      <a href="https://x.com/aeonframework" title="Follow @aeonframework on X"><img src="../docs/assets/comm-x-aeon.jpg" alt="Follow @aeonframework on X for launches, demos, and updates." width="100%"/></a>
+    </td>
+    <td align="center" valign="middle" width="33%">
+      <a href="https://www.aeon.fun/docs" title="Read the Aeon docs"><img src="../docs/assets/comm-docs-aeon.jpg" alt="Read the Aeon documentation - guides and reference." width="100%"/></a>
+    </td>
+    <td align="center" valign="middle" width="33%">
+      <a href="https://bankr.bot/discover/0xbf8e8f0e8866a7052f948c16508644347c57aba3" title="$aeon on Bankr"><img src="../docs/assets/comm-bankr-aeon.jpg" alt="$aeon token on Bankr." width="100%"/></a>
+    </td>
+  </tr>
+</table>
+
+---
+
+## We love contributors
+
+<p align="center">
+  <img src="../docs/assets/we-love-contributors-aeon.jpg" alt="We love contributors — every bug fix, new skill, and doc tweak makes Aeon better. Big PRs and small ones, both welcome." width="100%" />
+</p>
+
+<p align="center">
+  <b>We're excited to meet you.</b><br/>
+  Every bug fix, new skill, or doc tweak makes Aeon better. Big PRs and small ones, both welcome.
+</p>
+
+<p align="center">
+  📝 <a href="CONTRIBUTING.md"><b>Contributing guide</b></a> &nbsp;·&nbsp;
+  💬 <a href="https://x.com/aeonframework"><b>Say hi on X</b></a>
+</p>
+
+---
+
+<p align="center"><sub>MIT · Support the project: <code>0xbf8e8f0e8866a7052f948c16508644347c57aba3</code> ⭐</sub></p>
+
+---
+
+Built by [Aaron Elijah Mars](https://aaronjmars.com), founder of Aeon and MiroShark · [@aaronjmars](https://github.com/aaronjmars)
