@@ -1,0 +1,19 @@
+{
+  "skill": "hunter-22",
+  "last_analyzed": "2026-10-07T19:46:46Z",
+  "quality_score": 3,
+  "assessment": "Functionally complete but minimal; relied on undocumented API and flagging duplicates without verification",
+  "flags": [
+    "unverifiable_claim",
+    "stale_data"
+  ],
+  "avg_score": 3,
+  "history": [
+    {
+      "date": "2026-10-07",
+      "score": 3,
+      "ts": "2026-10-07T19:46:46Z",
+      "harness": "claude"
+    }
+  ]
+}
